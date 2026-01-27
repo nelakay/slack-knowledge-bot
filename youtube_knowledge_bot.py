@@ -579,22 +579,35 @@ Please format your response as:
         return None
 
 def format_transcript(transcript):
-    """Format the Whisper transcript with timestamps"""
+    """Format the Whisper transcript with timestamps every 60 seconds"""
     if not transcript or not hasattr(transcript, 'segments'):
         return "Transcript not available."
 
     formatted_lines = []
+    last_timestamp_minute = -1  # Track when we last added a timestamp
+
     for segment in transcript.segments:
         # Access as object attributes, not dict
         start_time = getattr(segment, 'start', 0)
         text = getattr(segment, 'text', '').strip()
 
-        # Convert seconds to MM:SS format
-        minutes = int(start_time // 60)
-        seconds = int(start_time % 60)
-        timestamp = f"[{minutes:02d}:{seconds:02d}]"
+        if not text:
+            continue
 
-        formatted_lines.append(f"{timestamp} {text}")
+        # Calculate which 60-second interval this segment falls into
+        current_minute = int(start_time // 60)
+
+        # Only add timestamp when entering a new 60-second interval
+        if current_minute > last_timestamp_minute:
+            # Convert seconds to MM:SS format
+            minutes = int(start_time // 60)
+            seconds = int(start_time % 60)
+            timestamp = f"[{minutes:02d}:{seconds:02d}]"
+            formatted_lines.append(f"{timestamp} {text}")
+            last_timestamp_minute = current_minute
+        else:
+            # No timestamp, just the text
+            formatted_lines.append(text)
 
     return "\n\n".join(formatted_lines)
 

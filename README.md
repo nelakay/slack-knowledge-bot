@@ -9,7 +9,7 @@ A Slack bot that automatically processes YouTube videos and Instagram content sh
 - **Transcription** with OpenAI Whisper API
 - **AI-generated summaries** and table of contents using GPT-4o
 - **Auto-categorization** from predefined tags using GPT-4o-mini
-- **Timestamped transcripts** in `[MM:SS]` format
+- **Timestamped transcripts** with `[MM:SS]` markers every 60 seconds
 - **Embedded video player** in markdown
 
 ### Instagram Processing
@@ -71,7 +71,9 @@ AI-generated summary...
 
 [00:00] First segment of transcript...
 
-[00:15] Next segment...
+More text from the first minute...
+
+[01:00] Content from the second minute...
 ```
 
 ## Prerequisites
