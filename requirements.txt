@@ -1,0 +1,6 @@
+slack-bolt>=1.18.0
+slack-sdk>=3.21.0
+pytubefix>=5.0.0
+openai>=1.0.0
+pydub>=0.25.1
+yt-dlp>=2024.0.0
