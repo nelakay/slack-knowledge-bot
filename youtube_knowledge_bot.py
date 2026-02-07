@@ -7,6 +7,7 @@ Supports forwarded messages - links back to original message
 
 import os
 import re
+import uuid
 import tempfile
 import threading
 from pathlib import Path
@@ -38,6 +39,10 @@ DIGEST_CHANNEL = None  # Will be set to the last channel where a video was proce
 # Track processed videos for daily digest
 daily_digest_videos = []
 digest_lock = threading.Lock()
+
+# Track failed items for retry (keyed by a unique retry ID)
+failed_items_registry = {}
+failed_items_lock = threading.Lock()
 
 # YouTube URL patterns
 YOUTUBE_PATTERNS = [
@@ -925,7 +930,8 @@ def process_youtube_video(video_id, channel, slack_message_url, needs_download=F
                 'success': False,
                 'error': "Could not fetch video metadata",
                 'timestamp': datetime.now(),
-                'platform': 'youtube'
+                'platform': 'youtube',
+                'slack_message_url': slack_message_url,
             })
         return
 
@@ -983,7 +989,8 @@ def process_youtube_video(video_id, channel, slack_message_url, needs_download=F
             'success': filepath is not None,
             'error': None if filepath else "Failed to create markdown file",
             'timestamp': datetime.now(),
-            'platform': 'youtube'
+            'platform': 'youtube',
+            'slack_message_url': slack_message_url,
         })
 
     if filepath:
@@ -1020,7 +1027,8 @@ def process_instagram_content(instagram_url, channel, slack_message_url):
                 'success': False,
                 'error': error or "Download failed",
                 'timestamp': datetime.now(),
-                'platform': 'instagram'
+                'platform': 'instagram',
+                'slack_message_url': slack_message_url,
             })
         return
 
@@ -1040,7 +1048,8 @@ def process_instagram_content(instagram_url, channel, slack_message_url):
             'success': media_path is not None,
             'error': None if media_path else "Failed to save media",
             'timestamp': datetime.now(),
-            'platform': 'instagram'
+            'platform': 'instagram',
+            'slack_message_url': slack_message_url,
         })
 
     if media_path:
@@ -1480,8 +1489,162 @@ def handle_process_history(ack, command, client, respond):
             f"📁 Files saved to: `{DOWNLOAD_DIR}`")
 
 
+@app.action("retry_process")
+def handle_retry(ack, body, client):
+    """Handle Retry button clicks from the daily digest.
+
+    Immediately re-processes the failed item and posts the result back to
+    the same channel so the user gets instant feedback.
+    """
+    ack()
+
+    action = body["actions"][0]
+    retry_id = action["value"]
+    channel = body["channel"]["id"]
+    user = body["user"]["id"]
+
+    # Look up the failed item context
+    with failed_items_lock:
+        item = failed_items_registry.pop(retry_id, None)
+
+    if not item:
+        client.chat_postMessage(
+            channel=channel,
+            text="This retry has already been used or has expired. "
+                 "If the issue persists, re-share the link and it will be re-processed."
+        )
+        return
+
+    video_id = item['video_id']
+    platform = item['platform']
+    slack_message_url = item.get('slack_message_url', '')
+    title = item.get('title', video_id)
+
+    # Update the button in the original message to show it's been clicked
+    try:
+        original_message = body.get("message", {})
+        original_blocks = original_message.get("blocks", [])
+        updated_blocks = []
+        for block in original_blocks:
+            if (block.get("accessory", {}).get("action_id") == "retry_process"
+                    and block.get("accessory", {}).get("value") == retry_id):
+                # Replace the button with a "Retrying..." context
+                block = dict(block)
+                block.pop("accessory", None)
+                block["text"] = {
+                    "type": "mrkdwn",
+                    "text": block["text"]["text"] + "\n_Retrying..._"
+                }
+            updated_blocks.append(block)
+
+        client.chat_update(
+            channel=channel,
+            ts=original_message["ts"],
+            blocks=updated_blocks,
+            text=original_message.get("text", "")
+        )
+    except Exception as e:
+        print(f"Could not update retry button: {e}")
+
+    # Post an immediate status message
+    client.chat_postMessage(
+        channel=channel,
+        text=f"Retrying *{title}*... processing now."
+    )
+
+    # Re-process based on platform
+    if platform == 'youtube':
+        success, filepath, error = process_video_bulk(
+            video_id, channel, '', client, slack_message_url
+        )
+        if success:
+            client.chat_postMessage(
+                channel=channel,
+                text=f"Retry succeeded for *{title}*\nFile saved to: `{filepath}`"
+            )
+        else:
+            # Re-register for another retry attempt
+            new_retry_id = str(uuid.uuid4())
+            with failed_items_lock:
+                failed_items_registry[new_retry_id] = item
+
+            client.chat_postMessage(
+                channel=channel,
+                text=f"Retry failed for *{title}*: {error}",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"Retry failed for *{title}*\nError: {error}"
+                        },
+                        "accessory": {
+                            "type": "button",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Retry Again"
+                            },
+                            "action_id": "retry_process",
+                            "value": new_retry_id,
+                            "style": "danger"
+                        }
+                    }
+                ]
+            )
+
+    elif platform == 'instagram':
+        instagram_url = f"https://www.instagram.com/p/{video_id}"
+        success, media_path, metadata, error = download_instagram_content(instagram_url, video_id)
+
+        if success and metadata:
+            md_filepath = create_instagram_markdown(video_id, instagram_url, metadata, media_path, slack_message_url)
+            client.chat_postMessage(
+                channel=channel,
+                text=f"Retry succeeded for *{title}*\nFile saved to: `{media_path}`"
+            )
+        else:
+            # Re-register for another retry attempt
+            new_retry_id = str(uuid.uuid4())
+            with failed_items_lock:
+                failed_items_registry[new_retry_id] = item
+
+            client.chat_postMessage(
+                channel=channel,
+                text=f"Retry failed for *{title}*: {error}",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"Retry failed for *{title}*\nError: {error}"
+                        },
+                        "accessory": {
+                            "type": "button",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Retry Again"
+                            },
+                            "action_id": "retry_process",
+                            "value": new_retry_id,
+                            "style": "danger"
+                        }
+                    }
+                ]
+            )
+
+    else:
+        client.chat_postMessage(
+            channel=channel,
+            text=f"Unknown platform `{platform}` for *{title}*. Cannot retry."
+        )
+
+
 def send_daily_digest(client):
-    """Send the daily digest of processed content to Slack."""
+    """Send the daily digest of processed content to Slack.
+
+    Failed items include a Retry button that immediately re-processes and
+    posts the result back, so users don't have to wait for the next digest.
+    """
     global daily_digest_videos, DIGEST_CHANNEL
 
     with digest_lock:
@@ -1504,38 +1667,128 @@ def send_daily_digest(client):
     youtube_success = [v for v in successful if v.get('platform') == 'youtube']
     instagram_success = [v for v in successful if v.get('platform') == 'instagram']
 
-    message_parts = [f"*Daily Knowledge Base Digest* - {datetime.now().strftime('%A, %B %d, %Y')}"]
-    message_parts.append(f"\n{len(successful)} item(s) processed today\n")
+    # Build Block Kit blocks for the digest
+    blocks = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": f"Daily Knowledge Base Digest - {datetime.now().strftime('%A, %B %d, %Y')}"
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{len(successful)} item(s) processed today"
+            }
+        }
+    ]
 
     if youtube_success:
-        message_parts.append(f"*YouTube ({len(youtube_success)}):*")
+        blocks.append({"type": "divider"})
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*YouTube ({len(youtube_success)}):*"
+            }
+        })
         for v in youtube_success:
             tags = ', '.join(v['categories']) if v['categories'] else 'none'
-            message_parts.append(
-                f"• *{v['title']}*\n"
-                f"  Channel: {v['channel']} | Duration: {v['duration']} | Tags: {tags}"
-            )
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*{v['title']}*\n"
+                        f"Channel: {v['channel']} | Duration: {v['duration']} | Tags: {tags}"
+                    )
+                }
+            })
 
     if instagram_success:
-        message_parts.append(f"\n*Instagram ({len(instagram_success)}):*")
+        blocks.append({"type": "divider"})
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Instagram ({len(instagram_success)}):*"
+            }
+        })
         for v in instagram_success:
-            message_parts.append(
-                f"• *{v['title']}*\n"
-                f"  Uploader: {v['channel']} | Duration: {v['duration']}"
-            )
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*{v['title']}*\n"
+                        f"Uploader: {v['channel']} | Duration: {v['duration']}"
+                    )
+                }
+            })
 
     if failed:
-        message_parts.append(f"\n{len(failed)} item(s) failed:")
+        blocks.append({"type": "divider"})
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*{len(failed)} item(s) failed:*"
+            }
+        })
         for v in failed:
-            platform = v.get('platform', 'unknown')
-            message_parts.append(f"• [{platform}] {v['title']}: {v['error']}")
+            # Register this failed item so the retry handler can look it up
+            retry_id = str(uuid.uuid4())
+            with failed_items_lock:
+                failed_items_registry[retry_id] = {
+                    'video_id': v['video_id'],
+                    'platform': v.get('platform', 'youtube'),
+                    'channel': DIGEST_CHANNEL,
+                    'slack_message_url': v.get('slack_message_url', ''),
+                    'title': v['title'],
+                }
 
-    message_parts.append(f"\nFiles saved to: `{DOWNLOAD_DIR}`")
+            platform = v.get('platform', 'unknown')
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"[{platform}] *{v['title']}*\nError: {v['error']}"
+                },
+                "accessory": {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Retry"
+                    },
+                    "action_id": "retry_process",
+                    "value": retry_id,
+                    "style": "primary"
+                }
+            })
+
+    blocks.append({"type": "divider"})
+    blocks.append({
+        "type": "context",
+        "elements": [
+            {
+                "type": "mrkdwn",
+                "text": f"Files saved to: `{DOWNLOAD_DIR}`"
+            }
+        ]
+    })
+
+    # Build a plain-text fallback for notifications
+    fallback_parts = [f"Daily Knowledge Base Digest - {datetime.now().strftime('%A, %B %d, %Y')}"]
+    fallback_parts.append(f"{len(successful)} processed, {len(failed)} failed")
+    fallback_text = '\n'.join(fallback_parts)
 
     try:
         client.chat_postMessage(
             channel=DIGEST_CHANNEL,
-            text='\n'.join(message_parts)
+            text=fallback_text,
+            blocks=blocks
         )
         print(f"[{datetime.now()}] Daily digest sent to {DIGEST_CHANNEL}")
     except Exception as e:
