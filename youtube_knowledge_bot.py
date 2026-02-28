@@ -58,7 +58,7 @@ INSTAGRAM_DIR = DOWNLOAD_DIR / "instagram"
 INSTAGRAM_DIR.mkdir(parents=True, exist_ok=True)
 
 # YouTube video save directory
-YOUTUBE_VIDEO_DIR = DOWNLOAD_DIR / "youtube"
+YOUTUBE_VIDEO_DIR = DOWNLOAD_DIR / "assets"
 YOUTUBE_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 
 # Allowed categories for tagging (no spaces)
@@ -673,8 +673,18 @@ def create_markdown_file(video_id, metadata, transcript, summary_and_toc, slack_
 
         youtube_url = f"https://www.youtube.com/watch?v={video_id}"
 
-        # YouTube embed iframe
-        iframe_code = f'<iframe width="560" height="315" src="https://www.youtube.com/embed/{video_id}" title="{metadata["title"]}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>'
+        # Video embed: use local file if downloaded, otherwise fall back to iframe
+        if video_path:
+            try:
+                relative_video = Path(video_path).relative_to(DOWNLOAD_DIR)
+                video_embed = f'![[{relative_video}]]'
+                video_file_line = f'\nvideo_file: "{relative_video}"'
+            except ValueError:
+                video_embed = f'![[{video_path}]]'
+                video_file_line = f'\nvideo_file: "{video_path}"'
+        else:
+            video_embed = f'<iframe width="560" height="315" src="https://www.youtube.com/embed/{video_id}" title="{metadata["title"]}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>'
+            video_file_line = ""
 
         # Format the transcript
         formatted_transcript = format_transcript(transcript) if transcript else "Transcript not available."
@@ -700,19 +710,6 @@ Summary could not be generated."""
         # Format tags for frontmatter
         tags_str = ", ".join(categories)
 
-        # Build video file reference for frontmatter and body
-        video_file_line = ""
-        video_body_line = ""
-        if video_path:
-            # Use relative path from DOWNLOAD_DIR for Obsidian compatibility
-            try:
-                relative_video = Path(video_path).relative_to(DOWNLOAD_DIR)
-                video_file_line = f'\nvideo_file: "{relative_video}"'
-                video_body_line = f'\n**Video File:** [[{relative_video}]]'
-            except ValueError:
-                video_file_line = f'\nvideo_file: "{video_path}"'
-                video_body_line = f'\n**Video File:** `{video_path}`'
-
         # Create the markdown content
         markdown_content = f"""---
 channel: "{metadata['channel']}"
@@ -726,13 +723,13 @@ tags: [{tags_str}]{video_file_line}
 
 # {metadata['title']}
 
-{iframe_code}
+{video_embed}
 
 **Channel:** [{metadata['channel']}](https://www.youtube.com/results?search_query={metadata['channel'].replace(' ', '+')})
 **Duration:** {metadata['duration_string']}
 **Tags:** {tags_str}
 **YouTube:** [{youtube_url}]({youtube_url})
-**Slack Reference:** [View in Slack]({slack_message_url}){video_body_line}
+**Slack Reference:** [View in Slack]({slack_message_url})
 
 ---
 
