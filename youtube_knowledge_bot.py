@@ -57,6 +57,10 @@ INSTAGRAM_PATTERNS = [
 INSTAGRAM_DIR = DOWNLOAD_DIR / "instagram"
 INSTAGRAM_DIR.mkdir(parents=True, exist_ok=True)
 
+# YouTube video save directory
+YOUTUBE_VIDEO_DIR = DOWNLOAD_DIR / "youtube"
+YOUTUBE_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+
 # Allowed categories for tagging (no spaces)
 ALLOWED_CATEGORIES = [
     "faith",           # religious/spiritual content
@@ -367,6 +371,54 @@ def download_audio(video_id):
         print(f"Error downloading audio: {e}")
         return None
 
+def download_youtube_video(video_id, metadata):
+    """Download YouTube video file using yt-dlp, capped at 1080p.
+
+    Returns (success, filepath) tuple.
+    """
+    try:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+
+        channel_name = sanitize_filename(metadata['channel'])
+        video_title = sanitize_filename(metadata['title'])
+        base_filename = f"{channel_name} - {video_title}"
+
+        ydl_opts = {
+            'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+            'merge_output_format': 'mp4',
+            'outtmpl': os.path.join(str(YOUTUBE_VIDEO_DIR), f'{base_filename}.%(ext)s'),
+            'quiet': True,
+            'no_warnings': True,
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }],
+        }
+
+        print(f"Downloading video (1080p max): {metadata['title']}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        # Find the downloaded file
+        final_path = YOUTUBE_VIDEO_DIR / f"{base_filename}.mp4"
+        if final_path.exists() and final_path.stat().st_size > 1024:
+            print(f"Video downloaded: {final_path}")
+            return True, str(final_path)
+
+        # Fallback: check for any file matching the base name
+        for f in YOUTUBE_VIDEO_DIR.iterdir():
+            if f.stem == base_filename and f.suffix in ['.mp4', '.mkv', '.webm']:
+                print(f"Video downloaded: {f}")
+                return True, str(f)
+
+        print("Video download completed but file not found")
+        return False, None
+
+    except Exception as e:
+        print(f"Error downloading video: {e}")
+        return False, None
+
+
 def transcribe_with_whisper(audio_path):
     """Transcribe audio using OpenAI Whisper API with chunking for large files"""
     try:
@@ -611,7 +663,7 @@ def format_transcript(transcript):
 
     return "\n\n".join(formatted_lines)
 
-def create_markdown_file(video_id, metadata, transcript, summary_and_toc, slack_message_url, categories):
+def create_markdown_file(video_id, metadata, transcript, summary_and_toc, slack_message_url, categories, video_path=None):
     """Create the markdown file with all content"""
     try:
         channel_name = sanitize_filename(metadata['channel'])
@@ -648,6 +700,19 @@ Summary could not be generated."""
         # Format tags for frontmatter
         tags_str = ", ".join(categories)
 
+        # Build video file reference for frontmatter and body
+        video_file_line = ""
+        video_body_line = ""
+        if video_path:
+            # Use relative path from DOWNLOAD_DIR for Obsidian compatibility
+            try:
+                relative_video = Path(video_path).relative_to(DOWNLOAD_DIR)
+                video_file_line = f'\nvideo_file: "{relative_video}"'
+                video_body_line = f'\n**Video File:** [[{relative_video}]]'
+            except ValueError:
+                video_file_line = f'\nvideo_file: "{video_path}"'
+                video_body_line = f'\n**Video File:** `{video_path}`'
+
         # Create the markdown content
         markdown_content = f"""---
 channel: "{metadata['channel']}"
@@ -656,7 +721,7 @@ youtube_url: "{youtube_url}"
 slack_message_url: "{slack_message_url}"
 duration: "{metadata['duration_string']}"
 upload_date: "{metadata.get('upload_date', 'Unknown')}"
-tags: [{tags_str}]
+tags: [{tags_str}]{video_file_line}
 ---
 
 # {metadata['title']}
@@ -667,7 +732,7 @@ tags: [{tags_str}]
 **Duration:** {metadata['duration_string']}
 **Tags:** {tags_str}
 **YouTube:** [{youtube_url}]({youtube_url})
-**Slack Reference:** [View in Slack]({slack_message_url})
+**Slack Reference:** [View in Slack]({slack_message_url}){video_body_line}
 
 ---
 
@@ -844,12 +909,7 @@ def handle_message(event, say, client):
                 print(f"Error sending duplicate notification: {e}")
             return
 
-        # Check if user wants to flag this for manual download
-        needs_download = 'download' in main_text.lower()
-        if needs_download:
-            print(f"Download flag detected for video {video_id}")
-
-        process_youtube_video(video_id, channel, slack_message_url, needs_download=needs_download)
+        process_youtube_video(video_id, channel, slack_message_url)
         return
 
     # Try to find Instagram post/reel
@@ -893,18 +953,12 @@ def handle_message(event, say, client):
         return
 
 
-def process_youtube_video(video_id, channel, slack_message_url, needs_download=False):
-    """Process a YouTube video silently and add to daily digest.
-
-    Args:
-        needs_download: If True, adds 'download' tag to flag for manual video download
-    """
+def process_youtube_video(video_id, channel, slack_message_url):
+    """Process a YouTube video: download video, transcribe, summarize, and add to daily digest."""
     global DIGEST_CHANNEL
 
     print(f"YouTube video detected: {video_id}")
     print(f"Slack reference URL: {slack_message_url}")
-    if needs_download:
-        print("Flagged for manual download")
 
     # Remember channel for daily digest
     DIGEST_CHANNEL = channel
@@ -922,6 +976,7 @@ def process_youtube_video(video_id, channel, slack_message_url, needs_download=F
                 'duration': "Unknown",
                 'categories': [],
                 'filepath': None,
+                'video_path': None,
                 'success': False,
                 'error': "Could not fetch video metadata",
                 'timestamp': datetime.now(),
@@ -929,8 +984,16 @@ def process_youtube_video(video_id, channel, slack_message_url, needs_download=F
             })
         return
 
-    # Download audio
-    print("Downloading audio...")
+    # Download full video
+    print("Downloading video...")
+    video_downloaded, video_path = download_youtube_video(video_id, metadata)
+    if video_downloaded:
+        print(f"Video saved to: {video_path}")
+    else:
+        print("Video download failed, continuing with transcription only")
+
+    # Download audio for transcription
+    print("Downloading audio for transcription...")
     audio_path = download_audio(video_id)
 
     transcript = None
@@ -961,15 +1024,11 @@ def process_youtube_video(video_id, channel, slack_message_url, needs_download=F
     # Auto-assign categories
     print("Assigning categories...")
     categories = assign_categories(transcript_text, metadata)
-
-    # Add download tag if flagged for manual download
-    if needs_download and 'download' not in categories:
-        categories.append('download')
     print(f"Assigned categories: {categories}")
 
     # Create markdown file
     print("Creating markdown file...")
-    filepath = create_markdown_file(video_id, metadata, transcript, summary_and_toc, slack_message_url, categories)
+    filepath = create_markdown_file(video_id, metadata, transcript, summary_and_toc, slack_message_url, categories, video_path)
 
     # Track for daily digest
     with digest_lock:
@@ -980,6 +1039,7 @@ def process_youtube_video(video_id, channel, slack_message_url, needs_download=F
             'duration': metadata['duration_string'],
             'categories': categories,
             'filepath': filepath,
+            'video_path': video_path,
             'success': filepath is not None,
             'error': None if filepath else "Failed to create markdown file",
             'timestamp': datetime.now(),
@@ -988,6 +1048,8 @@ def process_youtube_video(video_id, channel, slack_message_url, needs_download=F
 
     if filepath:
         print(f"Successfully processed: {metadata['title']} -> {filepath}")
+        if video_path:
+            print(f"Video file: {video_path}")
     else:
         print(f"Failed to create file for: {metadata['title']}")
 
@@ -1245,7 +1307,12 @@ def process_video_bulk(video_id, channel, ts, client, slack_message_url):
         if not metadata:
             return False, None, "Could not fetch video metadata"
 
-        # Download audio
+        # Download full video
+        video_downloaded, video_path = download_youtube_video(video_id, metadata)
+        if not video_downloaded:
+            print(f"Video download failed for {video_id}, continuing with transcription only")
+
+        # Download audio for transcription
         audio_path = download_audio(video_id)
 
         transcript = None
@@ -1276,7 +1343,7 @@ def process_video_bulk(video_id, channel, ts, client, slack_message_url):
         categories = assign_categories(transcript_text, metadata)
 
         # Create markdown file
-        filepath = create_markdown_file(video_id, metadata, transcript, summary_and_toc, slack_message_url, categories)
+        filepath = create_markdown_file(video_id, metadata, transcript, summary_and_toc, slack_message_url, categories, video_path)
 
         if filepath:
             return True, filepath, None
@@ -1511,9 +1578,10 @@ def send_daily_digest(client):
         message_parts.append(f"*YouTube ({len(youtube_success)}):*")
         for v in youtube_success:
             tags = ', '.join(v['categories']) if v['categories'] else 'none'
+            video_status = "downloaded" if v.get('video_path') else "transcript only"
             message_parts.append(
                 f"• *{v['title']}*\n"
-                f"  Channel: {v['channel']} | Duration: {v['duration']} | Tags: {tags}"
+                f"  Channel: {v['channel']} | Duration: {v['duration']} | Tags: {tags} | Video: {video_status}"
             )
 
     if instagram_success:
@@ -1566,7 +1634,7 @@ if __name__ == "__main__":
     print("Knowledge Bot is running!")
     print(f"Files will be saved to: {DOWNLOAD_DIR}")
     print("Supported platforms: YouTube, Instagram")
-    print("YouTube: Whisper transcription + GPT summaries")
+    print("YouTube: Video download (1080p) + Whisper transcription + GPT summaries")
     print("Instagram: Download only (no transcription)")
     print(f"Daily digest will be sent at {DIGEST_HOUR}:00")
     print("Use /process-history to bulk process YouTube videos from conversation history")
