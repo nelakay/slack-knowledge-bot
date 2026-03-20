@@ -53,6 +53,31 @@ INSTAGRAM_PATTERNS = [
     r'(?:https?://)?(?:www\.)?instagram\.com/tv/([a-zA-Z0-9_-]+)',     # IGTV
 ]
 
+# Pattern to match any URL (for stripping URLs from message text)
+URL_PATTERN = re.compile(r'<?(https?://[^\s>|]+)(?:\|[^>]*)?>?')
+
+# Slack message link pattern (for stripping forwarded link references)
+SLACK_LINK_PATTERN_FULL = re.compile(r'<?(https://[a-zA-Z0-9-]+\.slack\.com/archives/[A-Z0-9]+/p\d+)>?')
+
+
+def extract_message_content(text):
+    """Extract meaningful message content by stripping URLs and whitespace.
+
+    Returns the remaining text if there's substantive content beyond just URLs,
+    or None if the message was only URLs/empty.
+    """
+    if not text:
+        return None
+    # Remove all URLs (including Slack-formatted <url|label> links)
+    stripped = URL_PATTERN.sub('', text)
+    # Clean up whitespace
+    stripped = stripped.strip()
+    # Remove lines that are only whitespace
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    content = '\n'.join(lines)
+    return content if content else None
+
+
 # Instagram media save directory
 INSTAGRAM_DIR = DOWNLOAD_DIR / "instagram"
 INSTAGRAM_DIR.mkdir(parents=True, exist_ok=True)
@@ -188,7 +213,7 @@ def download_instagram_content(url, post_id):
         return False, None, None, str(e)
 
 
-def create_instagram_markdown(post_id, url, metadata, media_path, slack_message_url):
+def create_instagram_markdown(post_id, url, metadata, media_path, slack_message_url, message_content=None):
     """Create a simple markdown file for Instagram content"""
     try:
         safe_title = sanitize_filename(metadata['title'][:50])
@@ -205,6 +230,17 @@ def create_instagram_markdown(post_id, url, metadata, media_path, slack_message_
 
         # Get relative path to media file
         media_filename = os.path.basename(media_path) if media_path else "N/A"
+
+        # Build optional Slack context section
+        message_content_section = ""
+        if message_content:
+            message_content_section = f"""
+## Slack context
+
+{message_content}
+
+---
+"""
 
         markdown_content = f"""---
 platform: "instagram"
@@ -226,7 +262,7 @@ tags: [instagram]
 **Slack Reference:** [View in Slack]({slack_message_url})
 
 ---
-
+{message_content_section}
 ## Description
 
 {metadata['description'] or 'No description available.'}
@@ -663,7 +699,7 @@ def format_transcript(transcript):
 
     return "\n\n".join(formatted_lines)
 
-def create_markdown_file(video_id, metadata, transcript, summary_and_toc, slack_message_url, categories, video_path=None):
+def create_markdown_file(video_id, metadata, transcript, summary_and_toc, slack_message_url, categories, video_path=None, message_content=None):
     """Create the markdown file with all content"""
     try:
         channel_name = sanitize_filename(metadata['channel'])
@@ -710,6 +746,17 @@ Summary could not be generated."""
         # Format tags for frontmatter
         tags_str = ", ".join(categories)
 
+        # Build optional Slack context section
+        message_content_section = ""
+        if message_content:
+            message_content_section = f"""
+## Slack context
+
+{message_content}
+
+---
+"""
+
         # Create the markdown content
         markdown_content = f"""---
 channel: "{metadata['channel']}"
@@ -732,7 +779,7 @@ tags: [{tags_str}]{video_file_line}
 **Slack Reference:** [View in Slack]({slack_message_url})
 
 ---
-
+{message_content_section}
 {summary_and_toc}
 
 ---
@@ -863,6 +910,11 @@ def handle_message(event, say, client):
     search_text, slack_message_url = extract_original_message_info(event, client)
     main_text = event.get('text', '')
 
+    # Extract any meaningful text content from the message (beyond just URLs)
+    message_content = extract_message_content(search_text)
+    if not message_content:
+        message_content = extract_message_content(main_text)
+
     # Try to find YouTube video ID
     video_id = extract_video_id(search_text)
     if not video_id:
@@ -906,7 +958,7 @@ def handle_message(event, say, client):
                 print(f"Error sending duplicate notification: {e}")
             return
 
-        process_youtube_video(video_id, channel, slack_message_url)
+        process_youtube_video(video_id, channel, slack_message_url, message_content)
         return
 
     # Try to find Instagram post/reel
@@ -946,11 +998,11 @@ def handle_message(event, say, client):
                 print(f"Error sending duplicate notification: {e}")
             return
 
-        process_instagram_content(instagram_url, channel, slack_message_url)
+        process_instagram_content(instagram_url, channel, slack_message_url, message_content)
         return
 
 
-def process_youtube_video(video_id, channel, slack_message_url):
+def process_youtube_video(video_id, channel, slack_message_url, message_content=None):
     """Process a YouTube video: download video, transcribe, summarize, and add to daily digest."""
     global DIGEST_CHANNEL
 
@@ -1025,7 +1077,7 @@ def process_youtube_video(video_id, channel, slack_message_url):
 
     # Create markdown file
     print("Creating markdown file...")
-    filepath = create_markdown_file(video_id, metadata, transcript, summary_and_toc, slack_message_url, categories, video_path)
+    filepath = create_markdown_file(video_id, metadata, transcript, summary_and_toc, slack_message_url, categories, video_path, message_content)
 
     # Track for daily digest
     with digest_lock:
@@ -1051,7 +1103,7 @@ def process_youtube_video(video_id, channel, slack_message_url):
         print(f"Failed to create file for: {metadata['title']}")
 
 
-def process_instagram_content(instagram_url, channel, slack_message_url):
+def process_instagram_content(instagram_url, channel, slack_message_url, message_content=None):
     """Process Instagram content silently and add to daily digest."""
     global DIGEST_CHANNEL
 
@@ -1085,7 +1137,7 @@ def process_instagram_content(instagram_url, channel, slack_message_url):
 
     # Create markdown file
     print("Creating Instagram markdown file...")
-    md_filepath = create_instagram_markdown(post_id, instagram_url, metadata, media_path, slack_message_url)
+    md_filepath = create_instagram_markdown(post_id, instagram_url, metadata, media_path, slack_message_url, message_content)
 
     # Track for daily digest
     with digest_lock:
