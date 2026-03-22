@@ -29,7 +29,7 @@ app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # Configuration
-DOWNLOAD_DIR = Path("/Users/nelagueye/Downloads/Knowledger")
+DOWNLOAD_DIR = Path("/Volumes/Knowledger/vault/Knowledger")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Your Slack workspace URL (update this with your workspace)
@@ -1784,6 +1784,90 @@ def handle_retry_button(ack, body, client):
     client.chat_postMessage(channel=channel, text=summary)
 
 
+@app.event({"type": "message", "subtype": "file_share"})
+def handle_file_share(event, say, client):
+    """Route file_share messages to the main handler."""
+    print(f"[FILE_SHARE] event received, keys={list(event.keys())}")
+    handle_message(event, say, client)
+
+
+@app.event("file_shared")
+def handle_file_shared_events(body, logger, client):
+    """Handle file_shared events (Slack v2 upload API)."""
+    event = body.get('event', {})
+    print(f"[FILE_SHARED] event={event}")
+    file_id = event.get('file_id')
+    if not file_id:
+        return
+    try:
+        file_info = client.files_info(file=file_id)
+        file_data = file_info.get('file', {})
+        mimetype = file_data.get('mimetype', '')
+        name = file_data.get('name', '')
+        print(f"[FILE_SHARED] file={name} mime={mimetype}")
+
+        if not (mimetype.startswith('image/') or Path(name).suffix.lower() in IMAGE_EXTENSIONS):
+            print(f"[FILE_SHARED] Not an image, skipping")
+            return
+
+        # Build a synthetic event for process_slack_images
+        channels = file_data.get('channels', [])
+        groups = file_data.get('groups', [])
+        ims = file_data.get('ims', [])
+        channel = (channels or groups or ims or [None])[0] or event.get('channel_id', '')
+        ts = file_data.get('timestamp', '')
+        slack_message_url = get_slack_message_url(channel, str(ts)) if channel else ""
+
+        # Check for accompanying message text from shares
+        shares = file_data.get('shares', {})
+        message_text = ""
+        for share_type in shares.values():
+            for chan_shares in share_type.values():
+                for share in chan_shares:
+                    if share.get('ts'):
+                        # Fetch the actual message to get any text
+                        try:
+                            result = client.conversations_history(
+                                channel=channel,
+                                latest=share['ts'],
+                                limit=1,
+                                inclusive=True
+                            )
+                            if result.get('messages'):
+                                message_text = result['messages'][0].get('text', '')
+                                slack_message_url = get_slack_message_url(channel, share['ts'])
+                        except Exception:
+                            pass
+                        break
+                break
+            break
+
+        synthetic_event = {
+            'channel': channel,
+            'ts': str(ts),
+            'text': message_text,
+            'files': [file_data],
+        }
+
+        # Check if any platform URLs in the message — if so, skip image processing
+        all_text = message_text
+        if extract_video_id(all_text) or get_instagram_url(all_text) or extract_linkedin_url(all_text):
+            print(f"[FILE_SHARED] Message contains platform URL, skipping image-only processing")
+            return
+
+        # Check for generic resource URLs
+        resource_urls = extract_generic_urls(all_text)
+        if resource_urls:
+            process_resource_links(resource_urls, all_text, channel, slack_message_url)
+
+        process_slack_images(synthetic_event, channel, slack_message_url)
+        print(f"[FILE_SHARED] Processing complete")
+    except Exception as e:
+        print(f"[FILE_SHARED] Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 @app.event("message")
 def handle_message(event, say, client):
     """Handle incoming messages and detect YouTube/Instagram links (including forwarded messages)
@@ -1802,6 +1886,7 @@ def handle_message(event, say, client):
     subtype = event.get('subtype')
     if subtype in ['message_changed', 'message_deleted', 'channel_join', 'channel_leave']:
         return
+
 
     # Extract text and original URL (handles forwarded messages)
     search_text, slack_message_url, main_text_from_forward = extract_original_message_info(event, client)
