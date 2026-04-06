@@ -22,6 +22,10 @@ import urllib.parse
 import yt_dlp
 import instaloader
 
+# RapidAPI config for Instagram downloads
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")
+RAPIDAPI_IG_HOST = "social-media-video-downloader.p.rapidapi.com"
+
 # Initialize Slack app
 app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 
@@ -57,7 +61,7 @@ YOUTUBE_PATTERNS = [
 # Instagram URL patterns
 INSTAGRAM_PATTERNS = [
     r'(?:https?://)?(?:www\.)?instagram\.com/p/([a-zA-Z0-9_-]+)',      # Posts
-    r'(?:https?://)?(?:www\.)?instagram\.com/reel/([a-zA-Z0-9_-]+)',   # Reels
+    r'(?:https?://)?(?:www\.)?instagram\.com/reels?/([a-zA-Z0-9_-]+)',  # Reels (reel/ or reels/)
     r'(?:https?://)?(?:www\.)?instagram\.com/tv/([a-zA-Z0-9_-]+)',     # IGTV
 ]
 
@@ -111,10 +115,10 @@ IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '
 # ---------------------------------------------------------------------------
 
 # URL patterns that are already handled by platform-specific processors
-PLATFORM_URL_PATTERNS = YOUTUBE_PATTERNS + INSTAGRAM_PATTERNS + LINKEDIN_PATTERNS
+PLATFORM_URL_PATTERNS = YOUTUBE_PATTERNS + INSTAGRAM_PATTERNS
 
 def is_platform_url(url):
-    """Return True if the URL belongs to a platform we already handle (YouTube, Instagram, LinkedIn)."""
+    """Return True if the URL belongs to a platform we already handle (YouTube, Instagram)."""
     for pattern in PLATFORM_URL_PATTERNS:
         if re.search(pattern, url):
             return True
@@ -189,7 +193,7 @@ Resource:
 Rules:
 - ONLY use categories from the list above
 - Return 1-3 categories that best fit the content
-- If truly unsure, include "undefined"
+- ONLY use "undefined" if NO other category fits at all. Never combine "undefined" with other categories.
 - Return ONLY the category names, comma-separated, nothing else
 """
         response = openai_client.chat.completions.create(
@@ -203,13 +207,15 @@ Rules:
         raw = response.choices[0].message.content.strip().lower()
         assigned = [cat.strip() for cat in raw.split(",")]
         valid = [cat for cat in assigned if cat in ALLOWED_CATEGORIES]
-        return valid if valid else ["undefined"]
+        if not valid:
+            return ["undefined"]
+        return [cat for cat in valid if cat != "undefined"] or ["undefined"]
     except Exception as e:
         print(f"Error assigning resource tags: {e}")
         return ["undefined"]
 
 
-def update_resources_md(name, url, description="", tags=None):
+def update_resources_md(name, url, description="", tags=None, slack_message_url="", message_text=""):
     """Append an entry to the running resources.md table."""
     try:
         tags_str = ", ".join(tags) if tags else ""
@@ -217,12 +223,13 @@ def update_resources_md(name, url, description="", tags=None):
         name = name.replace("|", "-").replace("\n", " ")
         description = description.replace("|", "-").replace("\n", " ")[:200]
         tags_str = tags_str.replace("|", "-")
+        clean_text = re.sub(r'https?://\S+', '', message_text).strip().replace("|", "-").replace("\n", " ")[:200]
 
         if not RESOURCES_FILE.exists():
             header = (
                 "# Resources\n\n"
-                "| Name | URL | Description | Tags |\n"
-                "| ---- | --- | ----------- | ---- |\n"
+                "| # | Name | URL | Description | Tags | Slack Message | Message Text |\n"
+                "| - | ---- | --- | ----------- | ---- | ------------- | ------------ |\n"
             )
             with open(RESOURCES_FILE, 'w', encoding='utf-8') as f:
                 f.write(header)
@@ -236,7 +243,16 @@ def update_resources_md(name, url, description="", tags=None):
         except Exception:
             pass
 
-        row = f"| {name} | [{url}]({url}) | {description} | {tags_str} |\n"
+        # Count existing data rows to determine next row number
+        try:
+            existing_lines = RESOURCES_FILE.read_text(encoding='utf-8').splitlines()
+            row_count = sum(1 for l in existing_lines if l.startswith("|") and not l.startswith("| #") and not l.startswith("| -"))
+        except Exception:
+            row_count = 0
+        next_num = row_count + 1
+
+        slack_link = f"[Slack]({slack_message_url})" if slack_message_url else ""
+        row = f"| {next_num} | {name} | [{url}]({url}) | {description} | {tags_str} | {slack_link} | {clean_text} |\n"
         with open(RESOURCES_FILE, 'a', encoding='utf-8') as f:
             f.write(row)
         print(f"Added to resources.md: {name}")
@@ -261,7 +277,7 @@ def process_resource_links(urls, message_text, channel, slack_message_url):
         clean_text = re.sub(r'https?://\S+', '', message_text).strip()
 
         tags = assign_resource_tags(name, description, url, clean_text)
-        if update_resources_md(name=name, url=url, description=description, tags=tags):
+        if update_resources_md(name=name, url=url, description=description, tags=tags, slack_message_url=slack_message_url, message_text=message_text):
             added += 1
 
     if added:
@@ -341,7 +357,7 @@ Content:
 Rules:
 - ONLY use categories from the list above
 - Return 1-3 categories that best fit the content
-- If truly unsure, include "undefined"
+- ONLY use "undefined" if NO other category fits at all. Never combine "undefined" with other categories.
 - Return ONLY the category names, comma-separated, nothing else
 """
         response = openai_client.chat.completions.create(
@@ -355,7 +371,9 @@ Rules:
         raw = response.choices[0].message.content.strip().lower()
         assigned = [cat.strip() for cat in raw.split(",")]
         valid = [cat for cat in assigned if cat in ALLOWED_CATEGORIES]
-        return valid if valid else ["undefined"]
+        if not valid:
+            return ["undefined"]
+        return [cat for cat in valid if cat != "undefined"] or ["undefined"]
     except Exception as e:
         print(f"Error assigning image categories: {e}")
         return ["undefined"]
@@ -578,7 +596,7 @@ Post content:
 Rules:
 - ONLY use categories from the list above
 - Return 1-3 categories that best fit the content
-- If truly unsure, include "undefined"
+- ONLY use "undefined" if NO other category fits at all. Never combine "undefined" with other categories.
 - Return ONLY the category names, comma-separated, nothing else
 """
         response = openai_client.chat.completions.create(
@@ -593,8 +611,8 @@ Rules:
         assigned = [cat.strip() for cat in raw_categories.split(",")]
         valid_categories = [cat for cat in assigned if cat in ALLOWED_CATEGORIES]
         if not valid_categories:
-            valid_categories = ["undefined"]
-        return valid_categories
+            return ["undefined"]
+        return [cat for cat in valid_categories if cat != "undefined"] or ["undefined"]
     except Exception as e:
         print(f"Error assigning LinkedIn categories: {e}")
         return ["undefined"]
@@ -623,7 +641,7 @@ Post content:
 Rules:
 - ONLY use categories from the list above
 - Return 1-3 categories that best fit the content
-- If truly unsure, include "undefined"
+- ONLY use "undefined" if NO other category fits at all. Never combine "undefined" with other categories.
 - Return ONLY the category names, comma-separated, nothing else
 """
         response = openai_client.chat.completions.create(
@@ -638,8 +656,8 @@ Rules:
         assigned = [cat.strip() for cat in raw_categories.split(",")]
         valid_categories = [cat for cat in assigned if cat in ALLOWED_CATEGORIES]
         if not valid_categories:
-            valid_categories = ["undefined"]
-        return valid_categories
+            return ["undefined"]
+        return [cat for cat in valid_categories if cat != "undefined"] or ["undefined"]
     except Exception as e:
         print(f"Error assigning Instagram categories: {e}")
         return ["undefined"]
@@ -710,86 +728,120 @@ def check_linkedin_already_processed(url):
     return False, None, None
 
 
-def download_instagram_content(url, post_id):
-    """Download Instagram content using yt-dlp. Returns (success, filepath, metadata, error)"""
-    try:
-        temp_dir = tempfile.mkdtemp()
-        output_template = os.path.join(temp_dir, '%(title)s.%(ext)s')
+def download_instagram_via_rapidapi(url, post_id):
+    """Download Instagram content via RapidAPI. Returns (success, filepath, metadata, error)"""
+    if not RAPIDAPI_KEY:
+        return False, None, None, "RAPIDAPI_KEY not set"
 
-        ydl_opts = {
-            **_yt_dlp_base_opts(),
-            'outtmpl': output_template,
-            'extract_flat': False,
+    try:
+        api_url = f"https://{RAPIDAPI_IG_HOST}/instagram/v3/media/post/details"
+        params = {"shortcode": post_id, "renderableFormats": "720p,highres"}
+        headers = {
+            "Content-Type": "application/json",
+            "x-rapidapi-host": RAPIDAPI_IG_HOST,
+            "x-rapidapi-key": RAPIDAPI_KEY,
         }
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Extract info first
-            info = ydl.extract_info(url, download=True)
+        resp = requests.get(api_url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
 
-            if not info:
-                return False, None, None, "Could not extract info"
+        if data.get("error"):
+            return False, None, None, f"API error: {data['error']}"
 
-            # Get metadata
-            metadata = {
-                'title': info.get('title') or info.get('description', '')[:50] or f'Instagram_{post_id}',
-                'uploader': info.get('uploader') or info.get('channel') or 'Unknown',
-                'duration': info.get('duration') or 0,
-                'description': info.get('description') or '',
-                'timestamp': info.get('timestamp'),
-                'view_count': info.get('view_count'),
-                'like_count': info.get('like_count'),
-                'media_type': 'video' if info.get('ext') in ['mp4', 'webm', 'mov'] else 'image',
-            }
+        contents = data.get("contents", [])
+        if not contents:
+            return False, None, None, "No contents in API response"
 
-            # Format duration
-            if metadata['duration']:
-                mins = int(metadata['duration']) // 60
-                secs = int(metadata['duration']) % 60
-                metadata['duration_string'] = f"{mins}:{secs:02d}"
-            else:
-                metadata['duration_string'] = "N/A"
+        item = contents[0]
 
-            # Find downloaded file
-            downloaded_file = None
-            for f in os.listdir(temp_dir):
-                downloaded_file = os.path.join(temp_dir, f)
+        # Find best video with audio
+        video_url = None
+        for v in item.get("videos", []):
+            if v.get("metadata", {}).get("has_audio"):
+                video_url = v["url"]
                 break
+        # Fallback to first video if none has audio
+        if not video_url and item.get("videos"):
+            video_url = item["videos"][0]["url"]
 
-            if not downloaded_file or not os.path.exists(downloaded_file):
-                return False, None, metadata, "Download file not found"
+        # If no video, try images
+        image_urls = [img.get("url") for img in item.get("images", []) if img.get("url")]
 
-            # Move to assets folder with sanitized name
-            ext = os.path.splitext(downloaded_file)[1]
-            safe_title = sanitize_filename(metadata['title'][:50])
-            safe_uploader = sanitize_filename(metadata['uploader'])
-            final_filename = f"{safe_uploader} - {safe_title}{ext}"
+        if not video_url and not image_urls:
+            return False, None, None, "No downloadable media found"
+
+        # Build metadata from API response — metadata lives at top level, not inside contents
+        api_meta = data.get("metadata", {})
+        author = api_meta.get("author", {})
+        additional = api_meta.get("additionalData", {})
+        caption_edges = additional.get("edge_media_to_caption", {}).get("edges", [])
+        caption_text = caption_edges[0]["node"]["text"] if caption_edges else api_meta.get("title", "")
+
+        metadata = {
+            "title": (caption_text or "")[:50] or f"Instagram_{post_id}",
+            "uploader": author.get("full_name") or author.get("username") or "Unknown",
+            "duration": additional.get("video_duration") or 0,
+            "description": caption_text or "",
+            "timestamp": additional.get("taken_at_timestamp"),
+            "view_count": additional.get("video_view_count"),
+            "like_count": additional.get("edge_media_preview_like", {}).get("count"),
+            "media_type": "video" if video_url else "image",
+        }
+
+        if metadata["duration"]:
+            mins = int(metadata["duration"]) // 60
+            secs = int(metadata["duration"]) % 60
+            metadata["duration_string"] = f"{mins}:{secs:02d}"
+        else:
+            metadata["duration_string"] = "N/A"
+
+        safe_title = sanitize_filename(metadata["title"][:50])
+        safe_uploader = sanitize_filename(metadata["uploader"])
+
+        if video_url:
+            # Download the video
+            print(f"Downloading Instagram video via RapidAPI: {post_id}")
+            dl_resp = requests.get(video_url, timeout=120)
+            dl_resp.raise_for_status()
+
+            final_filename = f"{safe_uploader} - {safe_title}.mp4"
             final_path = ASSETS_DIR / final_filename
-
-            # Handle duplicate names
             counter = 1
             while final_path.exists():
-                final_filename = f"{safe_uploader} - {safe_title}_{counter}{ext}"
+                final_filename = f"{safe_uploader} - {safe_title}_{counter}.mp4"
                 final_path = ASSETS_DIR / final_filename
                 counter += 1
 
-            import shutil
-            shutil.move(downloaded_file, final_path)
-
-            # Clean up temp dir
-            try:
-                os.rmdir(temp_dir)
-            except:
-                pass
+            with open(final_path, "wb") as f:
+                f.write(dl_resp.content)
 
             return True, str(final_path), metadata, None
+        else:
+            # Download images
+            print(f"Downloading Instagram images via RapidAPI: {post_id}")
+            paths = []
+            for i, img_url in enumerate(image_urls):
+                dl_resp = requests.get(img_url, timeout=60)
+                dl_resp.raise_for_status()
+                suffix = f"_{i}" if len(image_urls) > 1 else ""
+                ext = ".jpg"
+                final_filename = f"{safe_uploader} - {safe_title}{suffix}{ext}"
+                final_path = ASSETS_DIR / final_filename
+                with open(final_path, "wb") as f:
+                    f.write(dl_resp.content)
+                paths.append(str(final_path))
+
+            return True, paths if len(paths) > 1 else paths[0], metadata, None
 
     except Exception as e:
-        error_str = str(e)
-        if "no video" in error_str.lower():
-            print("No video found, falling back to instaloader for image/carousel...")
-            return download_instagram_images(url, post_id)
-        print(f"Error downloading Instagram content: {e}")
-        return False, None, None, error_str
+        print(f"RapidAPI Instagram download failed: {e}")
+        return False, None, None, str(e)
+
+
+def download_instagram_content(url, post_id):
+    """Download Instagram content via RapidAPI. Returns (success, filepath, metadata, error)"""
+    return download_instagram_via_rapidapi(url, post_id)
 
 
 def download_instagram_images(url, post_id):
@@ -961,7 +1013,7 @@ tags: [{tags_str}]
 def _yt_dlp_base_opts():
     """Common yt-dlp options for YouTube anti-bot bypass."""
     return {
-        'cookiesfrombrowser': ('chrome', 'Profile 1', None, None),
+        'cookiefile': str(Path(__file__).parent / 'www.instagram.com_cookies.txt'),
         'quiet': True,
         'no_warnings': True,
         'remote_components': ['ejs:github'],
@@ -1366,7 +1418,7 @@ Transcript excerpt:
 Rules:
 - ONLY use categories from the list above
 - Return 1-3 categories that best fit the content
-- If truly unsure, include "undefined"
+- ONLY use "undefined" if NO other category fits at all. Never combine "undefined" with other categories.
 - Return ONLY the category names, comma-separated, nothing else
 
 Example response: technology, tutorials
@@ -1390,9 +1442,8 @@ Example response: technology, tutorials
 
         # If none are valid, use undefined
         if not valid_categories:
-            valid_categories = ["undefined"]
-
-        return valid_categories
+            return ["undefined"]
+        return [cat for cat in valid_categories if cat != "undefined"] or ["undefined"]
     except Exception as e:
         print(f"Error assigning categories: {e}")
         return ["undefined"]
@@ -1892,60 +1943,6 @@ def handle_message(event, say, client):
     search_text, slack_message_url, main_text_from_forward = extract_original_message_info(event, client)
     main_text = event.get('text', '')
 
-    # --- LinkedIn Detection (checked FIRST since LinkedIn posts may contain YouTube/IG URLs) ---
-    linkedin_url = extract_linkedin_url(search_text)
-    if not linkedin_url:
-        linkedin_url = extract_linkedin_url(main_text)
-
-    # Check attachments for LinkedIn links
-    if not linkedin_url:
-        for attachment in event.get('attachments', []):
-            for field in ['title_link', 'original_url', 'text']:
-                content = attachment.get(field, '')
-                if content:
-                    linkedin_url = extract_linkedin_url(content)
-                    if linkedin_url:
-                        break
-            if linkedin_url:
-                break
-
-    if linkedin_url:
-        # Check for duplicates
-        is_duplicate, existing_path, existing_title = check_linkedin_already_processed(linkedin_url)
-
-        if is_duplicate:
-            print(f"Duplicate LinkedIn post detected: {linkedin_url} -> {existing_path}")
-            try:
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=ts,
-                    text=f"This LinkedIn post has already been processed.\n\n"
-                         f"*{existing_title}*\n"
-                         f"File: `{existing_path}`"
-                )
-            except Exception as e:
-                print(f"Error sending duplicate notification: {e}")
-            return
-
-        # Extract post text: remove the LinkedIn URL from the message to get the pasted content
-        post_text = re.sub(r'https?://[^\s>|]+linkedin\.com[^\s>|]*', '', search_text).strip()
-        if not post_text:
-            post_text = re.sub(r'https?://[^\s>|]+linkedin\.com[^\s>|]*', '', main_text).strip()
-
-        if not post_text:
-            try:
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=ts,
-                    text="I detected a LinkedIn URL but no post content. Please paste the post text alongside the URL so I can process it."
-                )
-            except Exception as e:
-                print(f"Error sending LinkedIn prompt: {e}")
-            return
-
-        process_linkedin_post(linkedin_url, post_text, channel, slack_message_url)
-        return
-
     # Try to find YouTube video ID
     video_id = extract_video_id(search_text)
     if not video_id:
@@ -2034,6 +2031,12 @@ def handle_message(event, say, client):
 
     # --- Generic Resource Links (checked before images — picks up GitHub repos, articles, etc.) ---
     all_text = f"{main_text} {search_text}"
+    # Also pull URLs from attachment fields (unfurled links like LinkedIn, articles, etc.)
+    for attachment in event.get('attachments', []):
+        for field in ['title_link', 'original_url', 'from_url', 'text']:
+            val = attachment.get(field, '')
+            if val:
+                all_text = f"{all_text} {val}"
     resource_urls = extract_generic_urls(all_text)
     if resource_urls:
         process_resource_links(resource_urls, main_text, channel, slack_message_url)
@@ -2265,6 +2268,16 @@ def process_linkedin_post(linkedin_url, post_text, channel, slack_message_url):
             'slack_message_url': slack_message_url,
             'post_text': post_text  # Needed for LinkedIn retry
         })
+
+    # Add to resources.md
+    update_resources_md(
+        name=title,
+        url=linkedin_url,
+        description=post_text[:200] if post_text else "",
+        tags=["linkedin"] + categories,
+        slack_message_url=slack_message_url,
+        message_text=post_text,
+    )
 
     if md_filepath:
         print(f"Successfully processed LinkedIn post: {title} -> {md_filepath}")

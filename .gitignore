@@ -48,3 +48,6 @@ env/
 # Temporary files
 *.tmp
 *.temp
+
+# Cookies
+*_cookies.txt

@@ -30,12 +30,30 @@ if [ -z "$OPENAI_API_KEY" ]; then
 fi
 
 echo "🚀 Starting YouTube Knowledge Bot..."
-echo "📁 Files will be saved to: /Users/nelagueye/Downloads/Knowledger"
+echo "📁 Files will be saved to: /Volumes/Knowledger/vault/Knowledger"
 echo "🎤 Whisper transcription: enabled"
 echo "📝 GPT summaries: enabled"
 echo ""
 echo "Press Ctrl+C to stop the bot"
 echo ""
+
+# Kill any existing bot instances to avoid duplicates
+existing_pids=$(pgrep -f "youtube_knowledge_bot.py" 2>/dev/null)
+if [ -n "$existing_pids" ]; then
+    echo "Stopping existing bot instances..."
+    pkill -f "youtube_knowledge_bot.py" 2>/dev/null
+    sleep 2
+fi
+
+# Activate virtual environment
+VENV_DIR="$(dirname "$0")/.venv"
+if [ -d "$VENV_DIR" ]; then
+    source "$VENV_DIR/bin/activate"
+else
+    echo "❌ Error: Virtual environment not found at $VENV_DIR"
+    echo "Create it with: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt instaloader audioop-lts"
+    exit 1
+fi
 
 # Run the bot with unbuffered output so logs appear immediately
 python3 -u youtube_knowledge_bot.py
