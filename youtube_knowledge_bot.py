@@ -61,6 +61,11 @@ CATCHUP_LOOKBACK_HOURS = 24  # How far back to scan
 daily_digest_videos = []
 digest_lock = threading.Lock()
 
+# Persistent log of every processed item (one JSON object per line, appended at digest time).
+# Used by /show-failures to answer "what failed in the last N days".
+HISTORY_FILE = Path(__file__).parent / "processing_history.jsonl"
+history_lock = threading.Lock()
+
 # YouTube URL patterns
 YOUTUBE_PATTERNS = [
     r'(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})',
@@ -3280,6 +3285,134 @@ def handle_repair_vault(ack, command, client, respond):
     thread.start()
 
 
+@app.command("/show-failures")
+def handle_show_failures(ack, command, respond):
+    """Show items that failed to process within the last N days.
+
+    Usage:
+        /show-failures           (last 7 days)
+        /show-failures 30        (last 30 days)
+        /show-failures 21d       (last 21 days)
+        /show-failures all       (entire history)
+    """
+    ack()
+    arg = command.get('text', '').strip().lower()
+
+    if not arg:
+        days = 7
+    elif arg == 'all':
+        days = None
+    else:
+        m = re.match(r'^(\d+)\s*d?$', arg)
+        if not m:
+            respond("Usage: `/show-failures [days|all]` — e.g. `/show-failures 30`")
+            return
+        days = int(m.group(1))
+
+    since = (datetime.now() - timedelta(days=days)) if days is not None else None
+    rows = read_processing_history(since=since)
+    failed = [r for r in rows if not r.get('success')]
+
+    window_label = f"last {days} day(s)" if days is not None else "all time"
+
+    if not rows:
+        respond(f"No processing history recorded yet (file: `{HISTORY_FILE}`). "
+                f"Entries are written at the daily digest (22:00) — anything from before "
+                f"this feature was added won't appear here.")
+        return
+
+    if not failed:
+        respond(f"No failures in the {window_label}. ({len(rows)} item(s) succeeded.)")
+        return
+
+    # Group by platform for readability
+    by_platform = {}
+    for f in failed:
+        by_platform.setdefault(f.get('platform', 'unknown'), []).append(f)
+
+    lines = [f"*Failures in the {window_label}: {len(failed)} of {len(rows)} item(s)*\n"]
+    for platform, items in sorted(by_platform.items()):
+        lines.append(f"*{platform.title()} ({len(items)}):*")
+        for f in items[:50]:  # cap per platform to keep message under Slack limits
+            ts = f.get('timestamp', '')[:10]  # YYYY-MM-DD
+            title = f.get('title') or f.get('url') or '(no title)'
+            err = (f.get('error') or '').strip().replace('\n', ' ')
+            if len(err) > 140:
+                err = err[:137] + '...'
+            url = f.get('url', '')
+            lines.append(f"• `{ts}` *{title[:80]}*\n  {err or 'no error message'}\n  {url}")
+        if len(items) > 50:
+            lines.append(f"  _...and {len(items) - 50} more (truncated)_")
+        lines.append("")
+
+    respond("\n".join(lines))
+
+
+def _serialize_history_entry(entry):
+    """Compact a daily-digest entry into a JSON-safe dict for processing_history.jsonl."""
+    serialized = {
+        'timestamp': entry.get('timestamp').isoformat() if isinstance(entry.get('timestamp'), datetime) else str(entry.get('timestamp', '')),
+        'platform': entry.get('platform', 'unknown'),
+        'title': entry.get('title', ''),
+        'url': entry.get('url', ''),
+        'channel': entry.get('channel', ''),
+        'success': bool(entry.get('success')),
+        'error': entry.get('error') or None,
+        'filepath': entry.get('filepath') or None,
+        'slack_message_url': entry.get('slack_message_url', ''),
+        'categories': entry.get('categories', []) or [],
+    }
+    # LinkedIn-specific extras (kept short to keep the JSONL grep-friendly)
+    if entry.get('platform') == 'linkedin':
+        serialized['tools'] = entry.get('tools', []) or []
+        serialized['methods'] = entry.get('methods', []) or []
+        serialized['projects'] = entry.get('projects', []) or []
+    return serialized
+
+
+def append_processing_history(entries):
+    """Append a batch of digest entries to the JSONL history file."""
+    if not entries:
+        return
+    try:
+        with history_lock:
+            HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(HISTORY_FILE, 'a', encoding='utf-8') as f:
+                for entry in entries:
+                    f.write(json.dumps(_serialize_history_entry(entry), ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"Error writing processing history: {e}")
+
+
+def read_processing_history(since=None):
+    """Read all history entries newer than `since` (datetime). Returns a list of dicts."""
+    if not HISTORY_FILE.exists():
+        return []
+    rows = []
+    try:
+        with history_lock:
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if since:
+                        try:
+                            ts = datetime.fromisoformat(row.get('timestamp', ''))
+                        except Exception:
+                            continue
+                        if ts < since:
+                            continue
+                    rows.append(row)
+    except Exception as e:
+        print(f"Error reading processing history: {e}")
+    return rows
+
+
 def send_daily_digest(client):
     """Send the daily digest of processed content to Slack."""
     global daily_digest_videos, DIGEST_CHANNEL
@@ -3292,6 +3425,9 @@ def send_daily_digest(client):
         # Get videos and clear the list
         videos = daily_digest_videos.copy()
         daily_digest_videos = []
+
+    # Persist before posting so we never lose data even if Slack posting fails
+    append_processing_history(videos)
 
     if not DIGEST_CHANNEL:
         print(f"[{datetime.now()}] No channel set for digest - content processed but not reported")

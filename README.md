@@ -376,6 +376,21 @@ Process historical messages:
 /process-history C1234567890 30          # Last 30 days
 ```
 
+### Showing Failures (Slash Command)
+
+Every item the bot processes is appended to `processing_history.jsonl` (next to the bot script) at digest time. Query it via:
+
+```
+/show-failures           # last 7 days
+/show-failures 30        # last 30 days
+/show-failures 21d       # last 21 days
+/show-failures all       # entire recorded history
+```
+
+The bot replies with each failure grouped by platform: timestamp, title, error message, and the original URL. Note that history before this feature was added won't appear — for older failures, search your Slack channel for `"item(s) failed"` in past daily digests.
+
+To enable in Slack: api.slack.com/apps → Your App → **Slash Commands** → create `/show-failures` (description: "Show items that failed to process recently").
+
 ### Duplicate Detection
 
 If someone shares an already-processed video, the bot replies:
