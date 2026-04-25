@@ -387,9 +387,31 @@ Every item the bot processes is appended to `processing_history.jsonl` (next to 
 /show-failures all       # entire recorded history
 ```
 
-The bot replies with each failure grouped by platform: timestamp, title, error message, and the original URL. Note that history before this feature was added won't appear — for older failures, search your Slack channel for `"item(s) failed"` in past daily digests.
+The bot replies with each failure grouped by platform: timestamp, title, error message, and the original URL.
 
 To enable in Slack: api.slack.com/apps → Your App → **Slash Commands** → create `/show-failures` (description: "Show items that failed to process recently").
+
+### Backfilling Old Failures
+
+`processing_history.jsonl` only starts populating after the `/show-failures` feature was added. To recover older failures, run the backfill script — it parses past daily-digest messages from a Slack channel and reconstructs failure records (URL is pulled from the retry button's embedded JSON, error message from the digest text):
+
+```bash
+# Dry run to preview what will be added
+python3 backfill_failures.py --channel C0A99TH4Y2V --days 21 --dry-run
+
+# Append for real
+python3 backfill_failures.py --channel C0A99TH4Y2V --days 21
+
+# Also include successes (URL won't be available, title-only)
+python3 backfill_failures.py --channel C0A99TH4Y2V --days 21 --include-successes
+```
+
+The script:
+- Dedupes by `(date, platform, title)` so re-running is safe
+- Tags each backfilled row with `"backfilled": true` so you can distinguish reconstructed entries from live ones
+- Has a known limitation: titles containing a colon get truncated (the digest format uses `:` as the title/error separator without escaping)
+
+After running, `/show-failures 21d` will return the reconstructed entries alongside any live ones.
 
 ### Duplicate Detection
 
