@@ -393,23 +393,34 @@ To enable in Slack: api.slack.com/apps → Your App → **Slash Commands** → c
 
 ### Backfilling Old Failures
 
-`processing_history.jsonl` only starts populating after the `/show-failures` feature was added. To recover older failures, run the backfill script — it parses past daily-digest messages from a Slack channel and reconstructs failure records (URL is pulled from the retry button's embedded JSON, error message from the digest text):
+`processing_history.jsonl` only starts populating after the `/show-failures` feature was added. To recover older failures, you can either run the backfill from inside Slack or from the terminal — both reconstruct entries by parsing past daily-digest messages (URL pulled from the retry button's embedded JSON, error message from the digest text).
+
+#### From Slack (recommended)
+
+```
+/backfill                       # last 21 days, current channel, failures only
+/backfill 30                    # last 30 days
+/backfill all                   # entire channel history
+/backfill 21 C0A99TH4Y2V        # specific channel id
+/backfill 21 successes          # also include successes (no URL, title-only)
+```
+
+Run it in the channel where daily digests are posted (or pass the channel id explicitly). The bot replies with how many digests it scanned, how many failures/successes were added, and a hint to follow up with `/show-failures 21d`.
+
+To enable in Slack: api.slack.com/apps → Your App → **Slash Commands** → create `/backfill` (description: "Backfill processing history from past daily-digest messages").
+
+#### From the terminal
 
 ```bash
-# Dry run to preview what will be added
 python3 backfill_failures.py --channel C0A99TH4Y2V --days 21 --dry-run
-
-# Append for real
 python3 backfill_failures.py --channel C0A99TH4Y2V --days 21
-
-# Also include successes (URL won't be available, title-only)
 python3 backfill_failures.py --channel C0A99TH4Y2V --days 21 --include-successes
 ```
 
-The script:
-- Dedupes by `(date, platform, title)` so re-running is safe
-- Tags each backfilled row with `"backfilled": true` so you can distinguish reconstructed entries from live ones
-- Has a known limitation: titles containing a colon get truncated (the digest format uses `:` as the title/error separator without escaping)
+Both paths:
+- Dedupe by `(date, platform, title)` so re-running is safe
+- Tag each backfilled row with `"backfilled": true` so you can distinguish reconstructed entries from live ones
+- Have a known limitation: titles containing a colon get truncated (the digest format uses `:` as the title/error separator without escaping)
 
 After running, `/show-failures 21d` will return the reconstructed entries alongside any live ones.
 

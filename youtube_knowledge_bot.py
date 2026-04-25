@@ -22,6 +22,13 @@ import urllib.parse
 import yt_dlp
 import instaloader
 
+from backfill_failures import (
+    parse_digest_text,
+    parse_retry_button,
+    attach_urls_from_retry_button,
+    DIGEST_HEADER,
+)
+
 # RapidAPI config for Instagram downloads
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")
 RAPIDAPI_IG_HOST = "social-media-video-downloader.p.rapidapi.com"
@@ -3346,6 +3353,188 @@ def handle_show_failures(ack, command, respond):
         lines.append("")
 
     respond("\n".join(lines))
+
+
+def _existing_history_keys():
+    """Set of (date, platform, title) tuples already in HISTORY_FILE for dedup."""
+    keys = set()
+    if not HISTORY_FILE.exists():
+        return keys
+    with history_lock:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                ts = row.get("timestamp", "")[:10]
+                keys.add((ts, row.get("platform", ""), row.get("title", "")))
+    return keys
+
+
+def _backfill_worker(respond, client, channel, days, include_successes):
+    """Walk the channel's digest messages, parse failures (and optionally successes),
+    dedupe against HISTORY_FILE, and append new rows. Mirrors backfill_failures.py
+    but runs in-process with the bot's Slack client.
+    """
+    try:
+        oldest = (datetime.now() - timedelta(days=days)).timestamp() if days is not None else 0
+        cursor = None
+        digests = []
+        while True:
+            kwargs = {"channel": channel, "oldest": str(oldest), "limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor
+            resp = client.conversations_history(**kwargs)
+            for msg in resp.get("messages", []):
+                if DIGEST_HEADER in (msg.get("text") or ""):
+                    digests.append(msg)
+            if not resp.get("has_more"):
+                break
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+
+        seen = _existing_history_keys()
+        new_entries = []
+        for msg in digests:
+            try:
+                msg_dt = datetime.fromtimestamp(float(msg.get("ts", "0")))
+            except Exception:
+                continue
+            timestamp = msg_dt.isoformat()
+            date_key = timestamp[:10]
+
+            failures, successes = parse_digest_text(msg.get("text", "") or "")
+            failures = attach_urls_from_retry_button(failures, parse_retry_button(msg))
+
+            for f in failures:
+                key = (date_key, f["platform"], f["title"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                new_entries.append({
+                    "timestamp": timestamp,
+                    "platform": f["platform"],
+                    "title": f["title"],
+                    "url": f.get("url", ""),
+                    "channel": "",
+                    "success": False,
+                    "error": f.get("error", ""),
+                    "filepath": None,
+                    "slack_message_url": f.get("slack_message_url", ""),
+                    "categories": [],
+                    "backfilled": True,
+                })
+
+            if include_successes:
+                for s in successes:
+                    key = (date_key, s["platform"], s["title"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    new_entries.append({
+                        "timestamp": timestamp,
+                        "platform": s["platform"],
+                        "title": s["title"],
+                        "url": "",
+                        "channel": "",
+                        "success": True,
+                        "error": None,
+                        "filepath": None,
+                        "slack_message_url": "",
+                        "categories": [],
+                        "backfilled": True,
+                    })
+
+        if new_entries:
+            with history_lock:
+                HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+                with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+                    for e in new_entries:
+                        f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+        failed_count = sum(1 for e in new_entries if not e["success"])
+        success_count = sum(1 for e in new_entries if e["success"])
+
+        window = f"last {days} day(s)" if days is not None else "all available history"
+        if not digests:
+            respond(f"No digest messages found in this channel for the {window}. "
+                    f"Make sure you ran this in the channel where daily digests are posted.")
+            return
+
+        if not new_entries:
+            respond(f"Scanned {len(digests)} digest message(s) for the {window}. "
+                    f"Nothing new to add — every entry was already in `processing_history.jsonl`.")
+            return
+
+        msg_lines = [
+            f"*Backfill complete* — {window}",
+            f"• Scanned {len(digests)} digest message(s)",
+            f"• Added {failed_count} failure(s)",
+        ]
+        if include_successes:
+            msg_lines.append(f"• Added {success_count} success(es)")
+        msg_lines.append(f"\nRun `/show-failures {days}d` to view them." if days else "\nRun `/show-failures all` to view them.")
+        respond("\n".join(msg_lines))
+    except Exception as e:
+        print(f"[/backfill] Error: {e}")
+        respond(f"Backfill failed: {e}")
+
+
+@app.command("/backfill")
+def handle_backfill(ack, command, client, respond):
+    """Reconstruct processing_history.jsonl from past daily-digest messages.
+
+    Usage:
+        /backfill                       (last 21 days, current channel, failures only)
+        /backfill 30                    (last 30 days)
+        /backfill 21d                   (last 21 days)
+        /backfill all                   (entire channel history)
+        /backfill 21 C0A99TH4Y2V        (specific channel id)
+        /backfill 21 successes          (also include successes)
+        /backfill 21 C0A99TH4Y2V successes
+    """
+    ack()
+
+    args = (command.get("text") or "").strip().split()
+    days = 21
+    channel = command.get("channel_id")
+    include_successes = False
+
+    for token_arg in args:
+        t = token_arg.strip().lower()
+        if not t:
+            continue
+        if t == "all":
+            days = None
+        elif t in ("successes", "with-successes", "+successes"):
+            include_successes = True
+        elif re.match(r"^\d+\s*d?$", t):
+            m = re.match(r"^(\d+)", t)
+            days = int(m.group(1))
+        elif re.match(r"^[CGD][A-Z0-9]{8,}$", token_arg.strip()):
+            channel = token_arg.strip()
+        else:
+            respond(f"Couldn't parse argument `{token_arg}`. "
+                    f"Usage: `/backfill [days|all] [channel_id] [successes]`")
+            return
+
+    if not channel:
+        respond("No channel id available. Run this command in the channel where digests post, "
+                "or pass an explicit channel id: `/backfill 21 C0A99TH4Y2V`.")
+        return
+
+    window = f"last {days} day(s)" if days is not None else "all available history"
+    respond(f"Starting backfill for the {window} from <#{channel}>"
+            f"{' (including successes)' if include_successes else ''}. "
+            f"This may take a moment for large windows...")
+
+    threading.Thread(
+        target=_backfill_worker,
+        args=(respond, client, channel, days, include_successes),
+        daemon=True,
+    ).start()
 
 
 def _serialize_history_entry(entry):
