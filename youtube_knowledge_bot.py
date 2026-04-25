@@ -26,6 +26,16 @@ import instaloader
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")
 RAPIDAPI_IG_HOST = "social-media-video-downloader.p.rapidapi.com"
 
+# Apify config for LinkedIn post fetching (optional — manual paste works without it)
+APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN", "")
+# Actor ID in `username/actor-name` form. The default targets a public LinkedIn post
+# scraper; override via env if you prefer a different actor. Verify your actor's
+# input schema matches APIFY_LINKEDIN_INPUT_KEY below.
+APIFY_LINKEDIN_ACTOR = os.environ.get("APIFY_LINKEDIN_ACTOR", "curious_coder/linkedin-post-scraper")
+# JSON key the actor expects for the URL list. Most LinkedIn post actors use
+# "postUrls" or "urls". Change if your chosen actor uses a different field.
+APIFY_LINKEDIN_INPUT_KEY = os.environ.get("APIFY_LINKEDIN_INPUT_KEY", "postUrls")
+
 # Initialize Slack app
 app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 
@@ -76,6 +86,10 @@ LINKEDIN_PATTERNS = [
 INSTAGRAM_DIR = DOWNLOAD_DIR / "instagram"
 INSTAGRAM_DIR.mkdir(parents=True, exist_ok=True)
 
+# LinkedIn markdown save directory
+LINKEDIN_DIR = DOWNLOAD_DIR / "linkedin"
+LINKEDIN_DIR.mkdir(parents=True, exist_ok=True)
+
 # YouTube video save directory
 YOUTUBE_VIDEO_DIR = DOWNLOAD_DIR / "assets"
 YOUTUBE_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
@@ -115,10 +129,10 @@ IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '
 # ---------------------------------------------------------------------------
 
 # URL patterns that are already handled by platform-specific processors
-PLATFORM_URL_PATTERNS = YOUTUBE_PATTERNS + INSTAGRAM_PATTERNS
+PLATFORM_URL_PATTERNS = YOUTUBE_PATTERNS + INSTAGRAM_PATTERNS + LINKEDIN_PATTERNS
 
 def is_platform_url(url):
-    """Return True if the URL belongs to a platform we already handle (YouTube, Instagram)."""
+    """Return True if the URL belongs to a platform we already handle (YouTube, Instagram, LinkedIn)."""
     for pattern in PLATFORM_URL_PATTERNS:
         if re.search(pattern, url):
             return True
@@ -663,39 +677,101 @@ Rules:
         return ["undefined"]
 
 
-def create_linkedin_markdown(url, post_text, title, categories, slack_message_url):
-    """Create a markdown file for a LinkedIn post"""
+def create_linkedin_markdown(url, post_text, title, categories, slack_message_url,
+                             extraction=None, author="", posted_at=""):
+    """Create a markdown file for a LinkedIn post.
+
+    `extraction` is the dict returned by extract_linkedin_tools_and_methods (may be None).
+    Tools, methods, and project tags are written into YAML frontmatter as lists so
+    Obsidian Dataview / search can find them when working on a specific project.
+    """
     try:
         safe_title = sanitize_filename(title[:60])
         filename = f"LinkedIn - {safe_title}.md"
-        filepath = DOWNLOAD_DIR / filename
+        filepath = LINKEDIN_DIR / filename
 
         counter = 1
         while filepath.exists():
             filename = f"LinkedIn - {safe_title}_{counter}.md"
-            filepath = DOWNLOAD_DIR / filename
+            filepath = LINKEDIN_DIR / filename
             counter += 1
 
-        tags_str = ", ".join(["linkedin"] + categories)
+        extraction = extraction or {"tools": [], "methods": [], "projects_applicable_to": [], "summary": ""}
+        tools = extraction.get("tools", [])
+        methods = extraction.get("methods", [])
+        projects = extraction.get("projects_applicable_to", [])
+        summary = extraction.get("summary", "")
+
+        tag_list = ["linkedin"] + categories
+        tags_yaml = "[" + ", ".join(tag_list) + "]"
+        tool_names_yaml = "[" + ", ".join(json.dumps(t.get("name", "")) for t in tools) + "]"
+        method_names_yaml = "[" + ", ".join(json.dumps(m.get("name", "")) for m in methods) + "]"
+        projects_yaml = "[" + ", ".join(json.dumps(p) for p in projects) + "]"
+
+        # Body sections
+        if tools:
+            tools_section = "\n".join(
+                f"- **{t.get('name','')}**"
+                + (f" — [{t.get('url')}]({t.get('url')})" if t.get('url') else "")
+                + (f": {t.get('purpose')}" if t.get('purpose') else "")
+                for t in tools
+            )
+        else:
+            tools_section = "_None extracted._"
+
+        if methods:
+            methods_section = "\n".join(
+                f"- **{m.get('name','')}**"
+                + (f": {m.get('description')}" if m.get('description') else "")
+                for m in methods
+            )
+        else:
+            methods_section = "_None extracted._"
+
+        projects_section = ", ".join(f"`{p}`" for p in projects) if projects else "_None extracted._"
+        author_line = f"**Author:** {author}\n" if author else ""
+        posted_line = f"**Posted:** {posted_at}\n" if posted_at else ""
 
         markdown_content = f"""---
 platform: "linkedin"
-title: "{title}"
+title: "{sanitize_frontmatter(title)}"
+author: "{sanitize_frontmatter(author)}"
+posted_at: "{sanitize_frontmatter(posted_at)}"
 linkedin_url: "{url}"
 slack_message_url: "{slack_message_url}"
-tags: [{tags_str}]
+tags: {tags_yaml}
+tools: {tool_names_yaml}
+methods: {method_names_yaml}
+projects: {projects_yaml}
 ---
 
 # {title}
 
-**Platform:** LinkedIn
-**Tags:** {tags_str}
+{author_line}{posted_line}**Tags:** {", ".join(tag_list)}
 **LinkedIn:** [{url}]({url})
 **Slack Reference:** [View in Slack]({slack_message_url})
 
 ---
 
-## Post Content
+## Summary
+
+{summary or "_No summary generated._"}
+
+## Tools
+
+{tools_section}
+
+## Methods
+
+{methods_section}
+
+## Applicable Projects
+
+{projects_section}
+
+---
+
+## Original Post
 
 {post_text}
 """
@@ -726,6 +802,134 @@ def check_linkedin_already_processed(url):
     except Exception as e:
         print(f"Error checking LinkedIn duplicates: {e}")
     return False, None, None
+
+
+def fetch_linkedin_post_via_apify(url):
+    """Fetch a LinkedIn post's text and metadata via Apify.
+
+    Returns dict with keys: text, author, posted_at, raw (the first dataset item).
+    Returns None on failure or when APIFY_API_TOKEN is not configured.
+    """
+    if not APIFY_API_TOKEN:
+        print("APIFY_API_TOKEN not set; skipping Apify fetch")
+        return None
+
+    actor_path = APIFY_LINKEDIN_ACTOR.replace("/", "~")
+    api_url = f"https://api.apify.com/v2/acts/{actor_path}/run-sync-get-dataset-items"
+    body = {APIFY_LINKEDIN_INPUT_KEY: [url]}
+
+    try:
+        resp = requests.post(
+            api_url,
+            params={"token": APIFY_API_TOKEN},
+            json=body,
+            timeout=120,
+        )
+        resp.raise_for_status()
+        items = resp.json()
+    except Exception as e:
+        print(f"Apify fetch failed for {url}: {e}")
+        return None
+
+    if not items:
+        print(f"Apify returned no items for {url}")
+        return None
+
+    item = items[0]
+    # Different actors expose the post text under different keys; try the common ones.
+    text = (
+        item.get("text")
+        or item.get("postText")
+        or item.get("content")
+        or item.get("description")
+        or item.get("commentary")
+        or ""
+    )
+    author = (
+        item.get("authorName")
+        or item.get("author")
+        or item.get("userName")
+        or item.get("authorFullName")
+        or ""
+    )
+    posted_at = (
+        item.get("postedAt")
+        or item.get("publishedAt")
+        or item.get("date")
+        or item.get("postedAtIso")
+        or ""
+    )
+
+    if not text:
+        print(f"Apify item had no recognizable text field. Keys present: {list(item.keys())}")
+        return None
+
+    return {"text": text, "author": author, "posted_at": posted_at, "raw": item}
+
+
+def extract_linkedin_tools_and_methods(post_text):
+    """Use GPT-4o to extract tools, methods, and project applicability from a LinkedIn post.
+
+    Returns dict with keys: tools, methods, projects_applicable_to, summary.
+    Each list item has the shape documented in the prompt schema.
+    """
+    empty = {"tools": [], "methods": [], "projects_applicable_to": [], "summary": ""}
+    if not post_text or not post_text.strip():
+        return empty
+
+    schema_hint = """{
+  "summary": "1-3 sentence plain-English summary of what the post is teaching",
+  "tools": [
+    {"name": "...", "url": "" , "purpose": "what it is used for in this post"}
+  ],
+  "methods": [
+    {"name": "short name for the technique", "description": "1-2 sentences"}
+  ],
+  "projects_applicable_to": [
+    "short tag describing a project type or scenario where these tools/methods apply"
+  ]
+}"""
+
+    prompt = f"""You are extracting reusable knowledge from a LinkedIn post so it can be retrieved later when working on specific projects.
+
+Return a JSON object exactly matching this schema:
+{schema_hint}
+
+Rules:
+- Only include tools that are concretely named in the post (software, libraries, services, frameworks, products). Do NOT invent or infer.
+- If a URL for a tool is not in the post, leave url as an empty string.
+- Methods are reusable techniques, processes, frameworks, or workflows described in the post.
+- projects_applicable_to should be 2-6 short lowercase tags (kebab-case ok) like "ai-agents", "lead-gen", "video-editing", "data-pipelines".
+- If the post contains no tools or no methods, return empty arrays. Never fabricate.
+- summary must be plain text, no markdown.
+
+Post content:
+\"\"\"
+{post_text[:8000]}
+\"\"\"
+"""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You extract structured knowledge as strict JSON. Never add commentary."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=1200,
+        )
+        data = json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"Error extracting LinkedIn tools/methods: {e}")
+        return empty
+
+    return {
+        "tools": data.get("tools", []) or [],
+        "methods": data.get("methods", []) or [],
+        "projects_applicable_to": data.get("projects_applicable_to", []) or [],
+        "summary": data.get("summary", "") or "",
+    }
 
 
 def download_instagram_via_rapidapi(url, post_id):
@@ -2029,6 +2233,44 @@ def handle_message(event, say, client):
         process_instagram_content(instagram_url, channel, slack_message_url, forwarder_text=main_text, original_text=main_text_from_forward)
         return
 
+    # Try to find LinkedIn post
+    linkedin_url = extract_linkedin_url(search_text) or extract_linkedin_url(main_text)
+    if not linkedin_url:
+        for attachment in event.get('attachments', []):
+            for field in ['title_link', 'original_url', 'from_url', 'text']:
+                content = attachment.get(field, '')
+                if content:
+                    linkedin_url = extract_linkedin_url(content)
+                    if linkedin_url:
+                        break
+            if linkedin_url:
+                break
+
+    if linkedin_url:
+        is_duplicate, existing_path, existing_title = check_linkedin_already_processed(linkedin_url)
+        if is_duplicate:
+            print(f"Duplicate LinkedIn post detected: {linkedin_url} -> {existing_path}")
+            try:
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=ts,
+                    text=f"This LinkedIn post has already been processed.\n\n"
+                         f"*{existing_title}*\n"
+                         f"File: `{existing_path}`"
+                )
+            except Exception as e:
+                print(f"Error sending duplicate notification: {e}")
+            return
+
+        # Strip the LinkedIn URL itself from the message text so we don't pass the URL
+        # back in as "post text" and confuse the title/extraction prompts.
+        post_text_for_processing = re.sub(re.escape(linkedin_url), "", main_text or "").strip()
+        if main_text_from_forward:
+            post_text_for_processing = (post_text_for_processing + "\n" + main_text_from_forward).strip()
+
+        process_linkedin_post(linkedin_url, post_text_for_processing, channel, slack_message_url)
+        return
+
     # --- Generic Resource Links (checked before images — picks up GitHub repos, articles, etc.) ---
     all_text = f"{main_text} {search_text}"
     # Also pull URLs from attachment fields (unfurled links like LinkedIn, articles, etc.)
@@ -2230,7 +2472,12 @@ def process_instagram_content(instagram_url, channel, slack_message_url, forward
 
 
 def process_linkedin_post(linkedin_url, post_text, channel, slack_message_url):
-    """Process a LinkedIn post silently and add to daily digest."""
+    """Process a LinkedIn post: fetch content if missing, extract tools/methods, write markdown.
+
+    `post_text` is whatever text accompanied the URL in Slack. If empty, the bot tries
+    to fetch the post via Apify. If that also fails, the post is logged as failed so
+    the user can retry by re-sharing with the post text pasted.
+    """
     global DIGEST_CHANNEL
 
     print(f"LinkedIn post detected: {linkedin_url}")
@@ -2238,25 +2485,76 @@ def process_linkedin_post(linkedin_url, post_text, channel, slack_message_url):
 
     DIGEST_CHANNEL = channel
 
-    # Strip emojis from post text
-    post_text = strip_emojis(post_text)
+    post_text = strip_emojis(post_text or "")
+    author = ""
+    posted_at = ""
 
-    # Generate title and categories
-    print("Generating LinkedIn title and categories...")
+    # If we don't have substantive text from Slack, try Apify.
+    # 80 chars is roughly the length where a message looks like just the URL + a comment,
+    # below which extraction quality would be poor.
+    if len(post_text.strip()) < 80:
+        print("Post text not provided in Slack message; attempting Apify fetch...")
+        fetched = fetch_linkedin_post_via_apify(linkedin_url)
+        if fetched:
+            post_text = strip_emojis(fetched["text"])
+            author = fetched.get("author", "")
+            posted_at = fetched.get("posted_at", "")
+            print(f"Apify fetch succeeded: author={author!r}, {len(post_text)} chars")
+        else:
+            error_msg = (
+                "No post text found in Slack message and Apify fetch unavailable/failed. "
+                "Re-share the link with the post text pasted, or set APIFY_API_TOKEN."
+            )
+            print(f"Failed to obtain LinkedIn post content: {error_msg}")
+            try:
+                from slack_sdk import WebClient
+                slack_client = WebClient(token=os.environ.get("SLACK_BOT_TOKEN"))
+                slack_client.chat_postMessage(
+                    channel=channel,
+                    text=f"Couldn't process LinkedIn post: {linkedin_url}\n{error_msg}",
+                )
+            except Exception as notify_err:
+                print(f"Could not notify channel: {notify_err}")
+            with digest_lock:
+                daily_digest_videos.append({
+                    'video_id': linkedin_url,
+                    'title': linkedin_url,
+                    'channel': 'LinkedIn',
+                    'duration': 'N/A',
+                    'categories': [],
+                    'filepath': None,
+                    'success': False,
+                    'error': error_msg,
+                    'timestamp': datetime.now(),
+                    'platform': 'linkedin',
+                    'url': linkedin_url,
+                    'slack_message_url': slack_message_url,
+                    'post_text': post_text,
+                })
+            return
+
+    # Generate title, categories, and structured tool/method extraction
+    print("Generating LinkedIn title, categories, and tool/method extraction...")
     title = generate_linkedin_title(post_text)
     categories = assign_linkedin_categories(post_text)
+    extraction = extract_linkedin_tools_and_methods(post_text)
 
     print(f"Title: {title}")
     print(f"Categories: {categories}")
+    print(f"Tools: {[t.get('name') for t in extraction['tools']]}")
+    print(f"Methods: {[m.get('name') for m in extraction['methods']]}")
+    print(f"Projects: {extraction['projects_applicable_to']}")
 
-    # Create markdown file
-    md_filepath = create_linkedin_markdown(linkedin_url, post_text, title, categories, slack_message_url)
+    md_filepath = create_linkedin_markdown(
+        linkedin_url, post_text, title, categories, slack_message_url,
+        extraction=extraction, author=author, posted_at=posted_at,
+    )
 
     with digest_lock:
         daily_digest_videos.append({
             'video_id': linkedin_url,
             'title': title,
-            'channel': 'LinkedIn',
+            'channel': author or 'LinkedIn',
             'duration': 'N/A',
             'categories': categories,
             'filepath': md_filepath,
@@ -2266,14 +2564,17 @@ def process_linkedin_post(linkedin_url, post_text, channel, slack_message_url):
             'platform': 'linkedin',
             'url': linkedin_url,
             'slack_message_url': slack_message_url,
-            'post_text': post_text  # Needed for LinkedIn retry
+            'post_text': post_text,
+            'tools': [t.get('name') for t in extraction['tools']],
+            'methods': [m.get('name') for m in extraction['methods']],
+            'projects': extraction['projects_applicable_to'],
         })
 
     # Add to resources.md
     update_resources_md(
         name=title,
         url=linkedin_url,
-        description=post_text[:200] if post_text else "",
+        description=(extraction.get("summary") or post_text)[:200],
         tags=["linkedin"] + categories,
         slack_message_url=slack_message_url,
         message_text=post_text,

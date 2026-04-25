@@ -1,6 +1,6 @@
-# YouTube & Instagram Knowledge Bot for Slack
+# YouTube, Instagram & LinkedIn Knowledge Bot for Slack
 
-A Slack bot that automatically processes YouTube videos and Instagram content shared in your workspace, creating rich markdown files for your Obsidian knowledge base.
+A Slack bot that automatically processes YouTube videos, Instagram content, and LinkedIn posts shared in your workspace, creating rich markdown files for your Obsidian knowledge base.
 
 ## Features
 
@@ -17,6 +17,12 @@ A Slack bot that automatically processes YouTube videos and Instagram content sh
 - **Metadata extraction** (uploader, description, duration)
 - **No transcription** (designed for quick manual review)
 
+### LinkedIn Processing
+- **Auto-fetch** post content via Apify (when `APIFY_API_TOKEN` is set)
+- **Manual-paste fallback** — paste the post text into the Slack message alongside the URL and the bot uses that
+- **Tools/methods extraction** via GPT-4o into structured YAML frontmatter so Obsidian Dataview can find every post that mentions a given tool or method
+- **Project tagging** — each post gets `projects:` tags (e.g. `ai-agents`, `lead-gen`) describing the kind of work it applies to, making retrieval per-project trivial
+
 ### Smart Features
 - **Duplicate detection** - won't reprocess videos already in your vault
 - **Content validation** - checks for valid transcripts, not just file existence
@@ -30,10 +36,43 @@ A Slack bot that automatically processes YouTube videos and Instagram content sh
 Knowledger/
 ├── Channel Name - Video Title.md      # YouTube files
 ├── Another Channel - Another Video.md
-└── instagram/
-    ├── Uploader - Post Title.mp4      # Instagram media
-    └── Uploader - Post Title.md       # Instagram metadata
+├── instagram/
+│   ├── Uploader - Post Title.mp4      # Instagram media
+│   └── Uploader - Post Title.md       # Instagram metadata
+└── linkedin/
+    └── LinkedIn - Post Title.md       # LinkedIn post + extracted tools/methods
 ```
+
+### LinkedIn markdown example
+
+```markdown
+---
+platform: "linkedin"
+title: "Building AI agents with LangGraph"
+author: "Jane Doe"
+linkedin_url: "https://www.linkedin.com/posts/..."
+tags: [linkedin, engineering, ai]
+tools: ["LangGraph", "LangSmith", "Pinecone"]
+methods: ["ReAct loop", "Tool-call routing"]
+projects: ["ai-agents", "rag-systems"]
+---
+
+## Summary
+...
+
+## Tools
+- **LangGraph** — https://...: orchestrates multi-step agent state
+- **LangSmith**: tracing and eval
+
+## Methods
+- **ReAct loop**: alternating reasoning and tool calls
+- **Tool-call routing**: deterministic routing based on tool args
+
+## Applicable Projects
+`ai-agents`, `rag-systems`
+```
+
+In Obsidian, Dataview queries like `LIST FROM "linkedin" WHERE contains(projects, "ai-agents")` will surface every post relevant to a given project.
 
 ## Markdown Output Example
 
