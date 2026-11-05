@@ -337,6 +337,64 @@ Process historical messages:
 /process-history C1234567890 30          # Last 30 days
 ```
 
+### Backfilling DM history (where the bot can't go)
+
+Slack bots cannot be added to 1:1 DMs. To process YouTube links from DM
+history (years of them), use the one-off `backfill_youtube_from_dms.py`
+script. It talks to Slack with a **user token** (`xoxp-`), so it can see
+every conversation you can, DMs included, and feeds each unique video
+through the same processing pipeline used by the live bot.
+
+> **Caveat:** On the Slack Free plan only the last 90 days of history are
+> reachable via API. Anything older is gone. Paid plans (Pro / Business+ /
+> Enterprise) have full history.
+
+#### 1. Add a user token to your Slack app
+
+1. [api.slack.com/apps](https://api.slack.com/apps) → your app → **OAuth & Permissions**.
+2. Under **User Token Scopes** (not Bot Token Scopes), add: `search:read`.
+3. **Reinstall** the app to your workspace.
+4. Copy the **User OAuth Token** (starts with `xoxp-`) and put it in `.env`:
+
+```
+SLACK_USER_TOKEN=xoxp-...
+```
+
+#### 2. Dry-run: discover every YouTube link in your history
+
+```bash
+source .env
+export SLACK_USER_TOKEN OPENAI_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN
+python3 backfill_youtube_from_dms.py --dry-run --start-year 2021
+```
+
+This walks your history year by year with `search.messages`, extracts every
+unique YouTube video ID, and writes them to
+`DOWNLOAD_DIR/.backfill/discovered_urls.jsonl`. Nothing is processed.
+Review the file and the printed total before moving on.
+
+Interrupt anytime — a re-run resumes from the same JSONL.
+
+#### 3. Process the discovered list
+
+```bash
+python3 backfill_youtube_from_dms.py --process
+```
+
+This:
+- Loads `discovered_urls.jsonl`
+- Dedupes against your existing `Knowledger/` vault (skips any already processed)
+- Shows a count + rough OpenAI cost and asks to confirm
+- Runs the same `process_video_bulk()` the live bot uses (metadata → audio →
+  Whisper → GPT summary → markdown) and writes the result to the vault
+- Does **not** post anything to Slack
+
+Progress is written to `.backfill/processed.jsonl` and `.backfill/failed.jsonl`.
+Re-running `--process` picks up where it left off; vault-level dedup prevents
+reprocessing any video already in `Knowledger/`.
+
+Add `-y` to skip the confirmation prompt (e.g. for overnight runs).
+
 ### Duplicate Detection
 
 If someone shares an already-processed video, the bot replies:
