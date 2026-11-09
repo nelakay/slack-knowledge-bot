@@ -265,7 +265,29 @@ def update_resources_md(name, url, description="", tags=None, slack_message_url=
 def process_resource_links(urls, message_text, channel, slack_message_url):
     """Process one or more generic URLs: fetch metadata, tag, and add to resources.md."""
     added = 0
+
+    # Load resources.md once so URL-level dedup is a cheap in-memory check
+    # rather than a re-read per URL. This dedup must happen BEFORE fetch_url_metadata
+    # and assign_resource_tags — otherwise every already-tracked link burns an HTTP
+    # request and a GPT call just to be dropped by update_resources_md at the end.
+    try:
+        existing_resources = RESOURCES_FILE.read_text(encoding='utf-8') if RESOURCES_FILE.exists() else ""
+    except Exception:
+        existing_resources = ""
+
     for url in urls:
+        if url in existing_resources:
+            print(f"Skipping already-tracked resource: {url}")
+            continue
+
+        # LinkedIn posts also get a dedicated .md note elsewhere in the vault —
+        # check for that too before paying for metadata + tagging.
+        if extract_linkedin_url(url):
+            is_dup, existing_path, existing_title = check_linkedin_already_processed(url)
+            if is_dup:
+                print(f"Skipping already-processed LinkedIn post: {existing_title} -> {existing_path}")
+                continue
+
         print(f"Processing resource link: {url}")
         name, description = fetch_url_metadata(url)
         if not name:
