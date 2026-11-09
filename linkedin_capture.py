@@ -89,7 +89,24 @@ def sanitize(name, limit):
 
 def canon_url(u):
     p = urlsplit((u or "").strip())
-    return ("%s%s" % (p.netloc, p.path.rstrip("/"))).lower()
+    host = re.sub(r"^(?:www\.|m\.|touch\.)", "", p.netloc.lower())
+    return ("%s%s" % (host, p.path.rstrip("/"))).lower()
+
+
+# LinkedIn exposes several URL forms for the same post:
+#   /posts/firstname-lastname_blah-activity-7191234567890123456-xyz
+#   /feed/update/urn:li:activity:7191234567890123456
+#   /feed/update/urn:li:share:7191234567890123456  (less common)
+# They all share a 19-digit activity id. Extracting it lets us match across forms.
+_LINKEDIN_ID_RE = re.compile(r'(?:urn:li:(?:activity|share):|-activity[-:])(\d{15,25})', re.I)
+
+
+def linkedin_post_id(u):
+    """Return the LinkedIn activity/share id from any URL form, or None."""
+    if not u:
+        return None
+    m = _LINKEDIN_ID_RE.search(u)
+    return m.group(1) if m else None
 
 
 def sniff_ext(data):
@@ -116,8 +133,15 @@ def load_allowed_categories():
     return ["technology", "business", "tutorials", "news", "career", "undefined"]
 
 
-def find_duplicate(vault, key):
-    """Return the filename of an existing note with the same canonical LinkedIn URL."""
+def find_duplicate(vault, key, post_id=None):
+    """Return the filename of an existing note matching this LinkedIn post.
+
+    Matches on either (a) the canonical URL, or (b) the LinkedIn activity id when
+    available. The activity-id fallback catches the same post shared under a
+    different URL form (/posts/... vs /feed/update/urn:li:activity:...), which
+    the URL-only check was silently missing — and silently re-running the full
+    GPT + video-download + Whisper pipeline.
+    """
     candidates = list((vault / "linkedin").glob("*.md")) + list(vault.glob("LinkedIn - *.md"))
     for p in candidates:
         if p.name.startswith("._"):
@@ -127,7 +151,12 @@ def find_duplicate(vault, key):
         except Exception:
             continue
         m = re.search(r'^linkedin_url:\s*"?([^"\n]+)"?', head, re.M)
-        if m and canon_url(m.group(1)) == key:
+        if not m:
+            continue
+        stored = m.group(1).strip().strip('"')
+        if canon_url(stored) == key:
+            return p
+        if post_id and linkedin_post_id(stored) == post_id:
             return p
     return None
 
@@ -640,9 +669,13 @@ def capture(payload, client, vault, allowed):
 
     with _capture_lock:
         key = canon_url(url)
-        dup = find_duplicate(vault, key)
+        post_id = linkedin_post_id(url)
+        dup = find_duplicate(vault, key, post_id=post_id)
         if dup:
+            print("LinkedIn capture: duplicate -> %s (key=%s id=%s); merging links, skipping GPT/download/transcription"
+                  % (dup.name, key, post_id))
             return _merge_into_existing(dup, links, author)
+        print("LinkedIn capture: new post (key=%s id=%s); running full pipeline" % (key, post_id))
 
         title, cats = title_and_categories(text, client, allowed)
         out_dir, assets = vault / "linkedin", vault / "assets"
