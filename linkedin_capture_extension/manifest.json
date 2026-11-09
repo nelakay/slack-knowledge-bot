@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Save to Knowledger",
+  "version": "0.1.0",
+  "description": "Send the LinkedIn post you are viewing (URL, text, images) to your local Knowledger capture server.",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": [
+    "http://127.0.0.1:8791/*",
+    "https://media.licdn.com/*",
+    "https://*.licdn.com/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Save this LinkedIn post to Knowledger" }
+}

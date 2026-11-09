@@ -51,3 +51,8 @@ env/
 
 # Cookies
 *_cookies.txt
+
+# LinkedIn capture secrets
+*.token
+linkedin_capture_extension/config.js
+linkedin_capture_debug/

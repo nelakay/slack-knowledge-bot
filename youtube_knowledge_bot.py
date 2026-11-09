@@ -115,7 +115,7 @@ IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '
 # ---------------------------------------------------------------------------
 
 # URL patterns that are already handled by platform-specific processors
-PLATFORM_URL_PATTERNS = YOUTUBE_PATTERNS + INSTAGRAM_PATTERNS
+PLATFORM_URL_PATTERNS = YOUTUBE_PATTERNS + INSTAGRAM_PATTERNS + [r'linkedin\.com/', r'lnkd\.in/']
 
 def is_platform_url(url):
     """Return True if the URL belongs to a platform we already handle (YouTube, Instagram)."""
@@ -265,8 +265,24 @@ def update_resources_md(name, url, description="", tags=None, slack_message_url=
 def process_resource_links(urls, message_text, channel, slack_message_url):
     """Process one or more generic URLs: fetch metadata, tag, and add to resources.md."""
     added = 0
-    for url in urls:
+    for url in list(dict.fromkeys(urls))[:8]:
         print(f"Processing resource link: {url}")
+        # Richer path: read the page / GitHub repo, LLM summary, one note per link in <vault>/web/
+        try:
+            import web_resources
+            res = web_resources.process_url(url, message_text, slack_message_url, openai_client,
+                                            DOWNLOAD_DIR, ALLOWED_CATEGORIES)
+            print(f"Web resource: {res.get('status')} {res.get('note', '')} {res.get('reason', '')}")
+            if res.get("status") in ("duplicate", "skipped"):
+                continue
+            if res.get("status") in ("saved", "stub"):
+                if update_resources_md(name=res.get("title") or url, url=url, description=res.get("one_liner", ""),
+                                       tags=res.get("categories"), slack_message_url=slack_message_url,
+                                       message_text=message_text):
+                    added += 1
+                continue
+        except Exception as e:
+            print(f"Web resource note failed (falling back to metadata only): {e}")
         name, description = fetch_url_metadata(url)
         if not name:
             # Fallback: use domain + path as name
@@ -728,48 +744,106 @@ def check_linkedin_already_processed(url):
     return False, None, None
 
 
+def _fetch_instagram_api(post_id, max_attempts=3):
+    """Call RapidAPI Instagram endpoint with retries on transient failures.
+
+    Returns (data, error). Stops early on permanent errors like 'not_found'.
+    """
+    api_url = f"https://{RAPIDAPI_IG_HOST}/instagram/v3/media/post/details"
+    params = {"shortcode": post_id, "renderableFormats": "720p,highres"}
+    headers = {
+        "Content-Type": "application/json",
+        "x-rapidapi-host": RAPIDAPI_IG_HOST,
+        "x-rapidapi-key": RAPIDAPI_KEY,
+    }
+
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(api_url, headers=headers, params=params, timeout=30)
+            # Permanent client errors: do not retry
+            if resp.status_code in (401, 403, 404):
+                return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+            resp.raise_for_status()
+            data = resp.json()
+
+            api_err = data.get("error")
+            if api_err:
+                # 'not_found' is permanent — the post is gone from IG's perspective
+                code = (api_err.get("code") if isinstance(api_err, dict) else "") or ""
+                if code == "not_found":
+                    return None, f"API error: {api_err}"
+                last_err = f"API error: {api_err}"
+            elif data.get("contents"):
+                return data, None
+            elif (data.get("metadata", {}) or {}).get("additionalData", {}).get("display_url"):
+                # Single-image posts (XDTGraphImage): contents[] is empty,
+                # but the image URL lives in metadata.additionalData.display_url
+                return data, None
+            else:
+                last_err = "No contents in API response"
+        except requests.exceptions.RequestException as e:
+            last_err = f"Request failed: {e}"
+
+        if attempt < max_attempts:
+            wait = 2 ** attempt  # 2s, 4s
+            print(f"  Instagram API attempt {attempt}/{max_attempts} failed ({last_err}); retrying in {wait}s")
+            time.sleep(wait)
+
+    return None, last_err
+
+
 def download_instagram_via_rapidapi(url, post_id):
     """Download Instagram content via RapidAPI. Returns (success, filepath, metadata, error)"""
     if not RAPIDAPI_KEY:
         return False, None, None, "RAPIDAPI_KEY not set"
 
     try:
-        api_url = f"https://{RAPIDAPI_IG_HOST}/instagram/v3/media/post/details"
-        params = {"shortcode": post_id, "renderableFormats": "720p,highres"}
-        headers = {
-            "Content-Type": "application/json",
-            "x-rapidapi-host": RAPIDAPI_IG_HOST,
-            "x-rapidapi-key": RAPIDAPI_KEY,
-        }
-
-        resp = requests.get(api_url, headers=headers, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if data.get("error"):
-            return False, None, None, f"API error: {data['error']}"
+        data, fetch_err = _fetch_instagram_api(post_id)
+        if data is None:
+            return False, None, None, fetch_err
 
         contents = data.get("contents", [])
-        if not contents:
-            return False, None, None, "No contents in API response"
+        api_meta_top = data.get("metadata", {}) or {}
+        additional_top = api_meta_top.get("additionalData", {}) or {}
 
-        item = contents[0]
+        # Per-slide media: list of ("video"|"image", url). Each carousel slide
+        # contributes one entry, preferring video over image when both exist.
+        slides = []
 
-        # Find best video with audio
-        video_url = None
-        for v in item.get("videos", []):
-            if v.get("metadata", {}).get("has_audio"):
-                video_url = v["url"]
-                break
-        # Fallback to first video if none has audio
-        if not video_url and item.get("videos"):
-            video_url = item["videos"][0]["url"]
+        if contents:
+            for item in contents:
+                slide_video = None
+                for v in item.get("videos", []):
+                    if v.get("metadata", {}).get("has_audio"):
+                        slide_video = v["url"]
+                        break
+                if not slide_video and item.get("videos"):
+                    slide_video = item["videos"][0]["url"]
 
-        # If no video, try images
-        image_urls = [img.get("url") for img in item.get("images", []) if img.get("url")]
+                if slide_video:
+                    slides.append(("video", slide_video))
+                    continue
 
-        if not video_url and not image_urls:
+                slide_imgs = [img.get("url") for img in item.get("images", []) if img.get("url")]
+                if slide_imgs:
+                    slides.append(("image", slide_imgs[0]))
+        else:
+            # Single-image post: media lives in metadata.additionalData.
+            # Prefer the largest display_resource; fall back to display_url.
+            resources = additional_top.get("display_resources") or []
+            best = max(resources, key=lambda r: (r.get("config_width") or 0), default=None)
+            single = (best or {}).get("src") or additional_top.get("display_url")
+            if single:
+                slides.append(("image", single))
+
+        if not slides:
             return False, None, None, "No downloadable media found"
+
+        # Back-compat: surface a top-level video_url for single-video posts so
+        # metadata.media_type still reads as "video" for reels.
+        is_single_video = len(slides) == 1 and slides[0][0] == "video"
+        video_url = slides[0][1] if is_single_video else None
 
         # Build metadata from API response — metadata lives at top level, not inside contents
         api_meta = data.get("metadata", {})
@@ -799,10 +873,10 @@ def download_instagram_via_rapidapi(url, post_id):
         safe_title = sanitize_filename(metadata["title"][:50])
         safe_uploader = sanitize_filename(metadata["uploader"])
 
-        if video_url:
-            # Download the video
+        # Single-video shortcut: one .mp4, no _N suffix
+        if is_single_video:
             print(f"Downloading Instagram video via RapidAPI: {post_id}")
-            dl_resp = requests.get(video_url, timeout=120)
+            dl_resp = requests.get(slides[0][1], timeout=120)
             dl_resp.raise_for_status()
 
             final_filename = f"{safe_uploader} - {safe_title}.mp4"
@@ -817,22 +891,29 @@ def download_instagram_via_rapidapi(url, post_id):
                 f.write(dl_resp.content)
 
             return True, str(final_path), metadata, None
-        else:
-            # Download images
-            print(f"Downloading Instagram images via RapidAPI: {post_id}")
-            paths = []
-            for i, img_url in enumerate(image_urls):
-                dl_resp = requests.get(img_url, timeout=60)
-                dl_resp.raise_for_status()
-                suffix = f"_{i}" if len(image_urls) > 1 else ""
-                ext = ".jpg"
-                final_filename = f"{safe_uploader} - {safe_title}{suffix}{ext}"
-                final_path = ASSETS_DIR / final_filename
-                with open(final_path, "wb") as f:
-                    f.write(dl_resp.content)
-                paths.append(str(final_path))
 
-            return True, paths if len(paths) > 1 else paths[0], metadata, None
+        # Carousel (mixed media supported): one file per slide with _N suffix
+        print(f"Downloading Instagram carousel ({len(slides)} slides) via RapidAPI: {post_id}")
+        paths = []
+        for i, (kind, media_url) in enumerate(slides):
+            timeout = 120 if kind == "video" else 60
+            dl_resp = requests.get(media_url, timeout=timeout)
+            dl_resp.raise_for_status()
+            suffix = f"_{i}" if len(slides) > 1 else ""
+            ext = ".mp4" if kind == "video" else ".jpg"
+            final_filename = f"{safe_uploader} - {safe_title}{suffix}{ext}"
+            final_path = ASSETS_DIR / final_filename
+            counter = 1
+            base = final_filename.rsplit(".", 1)[0]
+            while final_path.exists():
+                final_filename = f"{base}_dup{counter}{ext}"
+                final_path = ASSETS_DIR / final_filename
+                counter += 1
+            with open(final_path, "wb") as f:
+                f.write(dl_resp.content)
+            paths.append(str(final_path))
+
+        return True, "|".join(paths), metadata, None
 
     except Exception as e:
         print(f"RapidAPI Instagram download failed: {e}")
@@ -1274,8 +1355,32 @@ def download_youtube_video(video_id, metadata):
         return False, None
 
 
+def _whisper_create(path, lang_state):
+    """One Whisper call. Accented English is sometimes auto-detected as Welsh/Nynorsk/Latin and then written as
+    phonetic nonsense. Once any part of the audio is detected as English (or misdetected), every later part is
+    forced to English, because one talk is in one language."""
+    import ig_enrich
+    def call(lang):
+        kw = {"language": lang} if lang else {}
+        with open(path, "rb") as fh:
+            return openai_client.audio.transcriptions.create(
+                model="whisper-1", file=fh, response_format="verbose_json", **kw)
+    lang = lang_state.get("lang") or (ig_enrich.WHISPER_LANGUAGE or None)
+    resp = call(lang)
+    if not lang:
+        detected = ig_enrich._resp_language(resp)
+        if detected in ig_enrich.MISDETECTED_LANGS:
+            print(f"Whisper detected '{detected}'; redoing as English")
+            lang_state["lang"] = "en"
+            resp = call("en")
+        elif detected == "english":
+            lang_state["lang"] = "en"
+    return resp
+
+
 def transcribe_with_whisper(audio_path):
     """Transcribe audio using OpenAI Whisper API with chunking for large files"""
+    lang_state = {}
     try:
         print(f"Transcribing audio file: {audio_path}")
 
@@ -1286,12 +1391,7 @@ def transcribe_with_whisper(audio_path):
         # If file is under 20MB, transcribe directly (using 20MB threshold for safety margin
         # since multipart form encoding adds overhead and can push files over the 25MB API limit)
         if file_size <= 20 * 1024 * 1024:
-            with open(audio_path, "rb") as audio_file:
-                transcript = openai_client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    response_format="verbose_json"
-                )
+            transcript = _whisper_create(audio_path, lang_state)
             return transcript
 
         # For large files, use pydub to split into chunks
@@ -1300,12 +1400,7 @@ def transcribe_with_whisper(audio_path):
             from pydub import AudioSegment
         except ImportError:
             print("pydub not installed, attempting direct transcription...")
-            with open(audio_path, "rb") as audio_file:
-                transcript = openai_client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    response_format="verbose_json"
-                )
+            transcript = _whisper_create(audio_path, lang_state)
             return transcript
 
         # Detect actual audio format using ffprobe (file extensions can be wrong)
@@ -1361,12 +1456,7 @@ def transcribe_with_whisper(audio_path):
             chunk.export(chunk_path, format="mp3", bitrate="64k")
 
             try:
-                with open(chunk_path, "rb") as chunk_file:
-                    chunk_transcript = openai_client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=chunk_file,
-                        response_format="verbose_json"
-                    )
+                chunk_transcript = _whisper_create(chunk_path, lang_state)
 
                 # Adjust timestamps and add to all_segments
                 if hasattr(chunk_transcript, 'segments'):
@@ -2174,7 +2264,7 @@ def process_instagram_content(instagram_url, channel, slack_message_url, forward
     if not success or not metadata:
         print(f"Failed to download Instagram content: {error}")
         try:
-            client.chat_postMessage(
+            app.client.chat_postMessage(
                 channel=channel,
                 text=f"Failed to download Instagram content: {instagram_url}\nError: {error or 'Download failed'}"
             )
@@ -2205,6 +2295,16 @@ def process_instagram_content(instagram_url, channel, slack_message_url, forward
     # Create markdown file
     print("Creating Instagram markdown file...")
     md_filepath = create_instagram_markdown(post_id, instagram_url, metadata, media_path, slack_message_url, forwarder_text, original_text, categories=categories)
+
+    # Enrich the note: transcript (video), on-image text (images/carousels), links + tools.
+    # Non-fatal: a failure here must never break ingestion. See ig_enrich.py.
+    if md_filepath and media_path:
+        try:
+            import ig_enrich
+            ig_report = ig_enrich.enrich_note(md_filepath, media_path.split("|"), openai_client)
+            print(f"Instagram enrichment: {ig_report['status']} {ig_report['errors'] or ''}")
+        except Exception as e:
+            print(f"Instagram enrichment failed (non-fatal): {e}")
 
     # Track for daily digest
     with digest_lock:
@@ -3188,12 +3288,22 @@ def run_catchup_scan(client):
     print(f"[{datetime.now()}] Catchup scan complete: {total_found} total links found, {total_processed} newly processed")
 
 
+PERIODIC_CATCHUP_MINUTES = 15
+
+
 def run_digest_scheduler(client):
-    """Background thread that sends daily digest at DIGEST_HOUR."""
-    print(f"[{datetime.now()}] Digest scheduler started - will send digest daily at {DIGEST_HOUR}:00")
+    """Background thread that sends daily digest at DIGEST_HOUR AND runs
+    periodic catchup every PERIODIC_CATCHUP_MINUTES.
+
+    Periodic catchup is the safety net for the times when the Slack socket
+    silently drops — we don't want messages sitting in the channel just
+    because the WebSocket died. Catchup uses the WebClient (HTTP), not the
+    socket, so it works even when the socket is broken.
+    """
+    print(f"[{datetime.now()}] Digest scheduler started - digest at {DIGEST_HOUR}:00, catchup every {PERIODIC_CATCHUP_MINUTES}min")
 
     last_digest_date = None
-    last_catchup_date = None
+    last_periodic_catchup = time.time()  # startup catchup counts
 
     # Run catchup on startup (handles wake from sleep)
     try:
@@ -3204,15 +3314,14 @@ def run_digest_scheduler(client):
     while True:
         now = datetime.now()
 
-        # Run catchup scan once daily, 1 hour before digest
-        catchup_hour = (DIGEST_HOUR - 1) % 24
-        if now.hour == catchup_hour and now.date() != last_catchup_date:
-            print(f"[{datetime.now()}] Running scheduled catchup scan...")
+        # Periodic catchup — safety net for broken Slack sockets
+        if time.time() - last_periodic_catchup >= PERIODIC_CATCHUP_MINUTES * 60:
+            print(f"[{datetime.now()}] Running periodic catchup scan...")
             try:
                 run_catchup_scan(client)
             except Exception as e:
-                print(f"[{datetime.now()}] Scheduled catchup failed: {e}")
-            last_catchup_date = now.date()
+                print(f"[{datetime.now()}] Periodic catchup failed: {e}")
+            last_periodic_catchup = time.time()
 
         # Check if it's digest time and we haven't sent today
         if now.hour == DIGEST_HOUR and now.date() != last_digest_date:
@@ -3224,8 +3333,38 @@ def run_digest_scheduler(client):
         time.sleep(60)
 
 
+def _run_socket_forever():
+    """Run the socket handler in a loop that reconnects hard on any failure.
+
+    Two layers of resilience:
+    - The Bolt SocketModeHandler internally reconnects via auto_reconnect_enabled
+      and a short ping_interval so dead peers are detected within ~20s.
+    - This outer loop is belt-and-suspenders: if start() ever returns or raises
+      (which we've seen happen after BrokenPipeError floods), we build a fresh
+      handler and try again with exponential backoff.
+    """
+    app_token = os.environ.get("SLACK_APP_TOKEN")
+    attempt = 0
+    while True:
+        try:
+            handler = SocketModeHandler(
+                app=app,
+                app_token=app_token,
+                auto_reconnect_enabled=True,
+                ping_interval=10,
+            )
+            print(f"[{datetime.now()}] Connecting Slack socket (attempt {attempt + 1})...")
+            handler.start()  # blocks until the receive loop exits
+            print(f"[{datetime.now()}] Slack socket handler returned; will reconnect.")
+        except Exception as e:
+            print(f"[{datetime.now()}] Slack socket handler crashed: {type(e).__name__}: {e}")
+        attempt += 1
+        wait = min(60, 2 ** min(attempt, 6))  # 2s, 4s, 8s, ..., cap 60s
+        print(f"[{datetime.now()}] Reconnecting in {wait}s")
+        time.sleep(wait)
+
+
 if __name__ == "__main__":
-    handler = SocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN"))
     print("Knowledge Bot is running!")
     print(f"Files will be saved to: {DOWNLOAD_DIR}")
     print("Supported platforms: YouTube, Instagram, LinkedIn, Static Images")
@@ -3240,4 +3379,11 @@ if __name__ == "__main__":
     digest_thread = threading.Thread(target=run_digest_scheduler, args=(slack_client,), daemon=True)
     digest_thread.start()
 
-    handler.start()
+    # LinkedIn one-click capture receiver (Chrome extension -> localhost). Non-fatal.
+    try:
+        import linkedin_capture
+        linkedin_capture.start_in_thread(openai_client, vault=DOWNLOAD_DIR)
+    except Exception as e:
+        print(f"LinkedIn capture not started: {e}")
+
+    _run_socket_forever()

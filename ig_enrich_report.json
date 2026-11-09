@@ -1,0 +1,22 @@
+{
+  "totals": {
+    "notes": 1,
+    "pending": 1,
+    "videos": 1,
+    "minutes": 0.0,
+    "images": 1,
+    "missing_media": 0,
+    "enriched": 1,
+    "failed": 0
+  },
+  "rows": [
+    {
+      "note": "Gurinderjeet Singh - Building Self-Prompting AI Systems at Anthropic.md",
+      "videos": 1,
+      "images": 1,
+      "missing": [],
+      "result": "enriched",
+      "errors": []
+    }
+  ]
+}
